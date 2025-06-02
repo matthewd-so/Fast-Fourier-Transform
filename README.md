@@ -1,7 +1,6 @@
 # GPU-Accelerated Particle Physics Simulation
 
-
-![Physics Simulation](https://github.com/user-attachments/assets/4aca1ee7-bd3f-4777-bae0-064e9dd4cd86)
+![Physics Simulation](https://github.com/user-attachments/assets/d882ad2c-310f-41ba-93d4-6074eb53cf01)
 
 A demonstration of a 2D particle system under gravity with elastic wall collisions and randomized elasticity. The core simulation runs on an NVIDIA GPU using CUDA and C, processing millions of particles in parallel. A complementary Python script provides a CPU-based visualization of the same physics for any platform.
 
