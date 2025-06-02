@@ -1,5 +1,8 @@
 # GPU-Accelerated Particle Physics Simulation
 
+
+![Physics Simulation](https://github.com/user-attachments/assets/4aca1ee7-bd3f-4777-bae0-064e9dd4cd86)
+
 A demonstration of a 2D particle system under gravity with elastic wall collisions and randomized elasticity. The core simulation runs on an NVIDIA GPU using CUDA and C, processing millions of particles in parallel. A complementary Python script provides a CPU-based visualization of the same physics for any platform.
 
 ## Features
@@ -8,28 +11,7 @@ A demonstration of a 2D particle system under gravity with elastic wall collisio
 - **Elastic Wall Collisions**: Particles bounce off all four boundaries of a 100×100 box.
 - **Randomized Elasticity**: Each particle’s restitution coefficient is chosen uniformly between 0.7 and 1.0, so some lose more energy on each bounce than others.
 - **Parallel Update Kernel**: A single CUDA kernel assigns one GPU thread to each particle, updating position and velocity in parallel.
-- **Modular Codebase**: Physics logic separated into `physics.cu`/`physics.h`, host orchestration in `main.cu`, and error handling in `utils.h`.
 - **CPU Visualization**: Python script (`visualize.py`) animates 2,000 particles under identical rules (gravity + wall collisions + random elasticity).
-
-## Repository Structure
-
-```
-.
-├── Makefile
-├── main.cu
-├── physics.cu
-├── physics.h
-├── utils.h
-├── visualize.py
-└── README.md
-```
-
-- **`main.cu`**: Host code that allocates space for particles on CPU and GPU, initializes data, launches the CUDA kernel, measures execution time, and cleans up.
-- **`physics.cu`**: Implements `initParticlesHost` (randomizes positions, velocities, and elasticity) and the CUDA kernel `updateParticlesKernel` (applies gravity and handles boundary collisions with damping).
-- **`physics.h`**: Defines the `Particle` struct (including position, velocity, and elasticity) and declares `initParticlesHost` and `updateParticlesKernel`.
-- **`utils.h`**: Defines `CHECK_CUDA`, a macro that wraps CUDA API calls and exits on error.
-- **`visualize.py`**: CPU-based animation using NumPy and Matplotlib. Initializes 2,000 particles with random positions, velocities, and elasticity, then updates and draws them on screen with gravity and wall collisions.
-- **`Makefile`**: Builds `physics.o` and `main.o` with `nvcc`, then links them into the `gpu_sim` executable. Targets: `all`, `clean`.
 
 ## Prerequisites
 
