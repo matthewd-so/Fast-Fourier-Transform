@@ -54,7 +54,7 @@ In this repository, `fft_cpu.c` implements an in-place Cooley–Tukey FFT in **C
 ### 1. CPU-Only Build & Run
 
 ```bash
-cd project/cpu-only
+cd project/CPU
 
 # Using relative include to parent for fft.h
 gcc -O3 -std=c99 -I.. main_cpu.c fft_cpu.c -lm -o fft_cpu
