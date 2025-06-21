@@ -10,7 +10,7 @@ NVCC ?= nvcc
 CC   ?= cc
 SM   ?= 75
 
-NVCCFLAGS ?= -O3 -arch=sm_$(SM) -Iinclude -lineinfo
+NVCCFLAGS ?= -O3 -arch=sm_$(SM) -Iinclude --use_fast_math -lineinfo
 CFLAGS    ?= -O3 -std=c99 -Iinclude
 
 GPU_SRC = src/fft_gpu.cu src/fft_cpu.c

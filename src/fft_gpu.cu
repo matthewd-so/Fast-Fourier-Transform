@@ -1,121 +1,150 @@
+/*
+ * Radix-2 Cooley-Tukey FFT (decimation in time) in CUDA.
+ *
+ * Pipeline for an N-point in-place transform (N a power of two):
+ *
+ *   1. Bit-reversal permutation                 fft_bitrev_kernel   (1 launch)
+ *   2. First log2(FFT_TILE) butterfly stages    fft_shared_kernel   (1 launch)
+ *      fused in one kernel: each block stages a contiguous tile of
+ *      FFT_TILE elements through shared memory, so those stages never
+ *      touch DRAM between butterflies.
+ *   3. Remaining stages (stride >= FFT_TILE)    fft_global_kernel   (1 launch each)
+ *      operate on global memory with fully coalesced float2 accesses:
+ *      consecutive threads read/write consecutive 8-byte elements.
+ *
+ * All kernels are enqueued on the default stream with no intermediate
+ * host synchronization; stream ordering alone enforces stage order.
+ * Twiddle factors come from the SFU via __sincosf.
+ */
 #include "fft.h"
 #include <cuda_runtime.h>
-#include <math.h>
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
+#define FFT_TILE    1024u  /* elements per block in the shared-memory stages */
+#define FFT_THREADS 256u   /* block size for the elementwise kernels */
+#define FFT_PI      3.14159265358979323846f
 
-#define THREADS 256
-
-__device__
-static GpuComplex cplx_mul(GpuComplex a, GpuComplex b) {
-    GpuComplex c;
-    c.real = a.real * b.real - a.imag * b.imag;
-    c.imag = a.real * b.imag + a.imag * b.real;
-    return c;
+__device__ __forceinline__ float2 cplx_mul(float2 a, float2 b) {
+    return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
-__global__
-void bit_reversal_permute(GpuComplex *data, size_t N, size_t logN) {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
+/* w = e^(dir * -2*pi*i * pos / m); dir = +1 forward, -1 inverse. */
+__device__ __forceinline__ float2 twiddle(int dir, unsigned pos, unsigned m) {
+    float s, c;
+    __sincosf((float)dir * -2.0f * FFT_PI * (float)pos / (float)m, &s, &c);
+    return make_float2(c, s);
+}
 
-    // Compute bit-reversed index 'rev' of i
-    size_t rev = 0;
-    size_t x = i;
-    for (size_t j = 0; j < logN; ++j) {
-        rev = (rev << 1) | (x & 1);
-        x >>= 1;
-    }
-    if (rev > i) {
-        // swap data[i] and data[rev]
-        GpuComplex tmp = data[i];
-        data[i] = data[rev];
-        data[rev] = tmp;
+static __global__ void fft_bitrev_kernel(float2 *data, unsigned n, unsigned shift) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const unsigned r = __brev(i) >> shift;
+    if (r > i) {
+        const float2 t = data[i];
+        data[i] = data[r];
+        data[r] = t;
     }
 }
 
-// One butterfly stage. Forward and inverse differ only in the sign of the
-// twiddle angle, so dir = +1 (forward) / -1 (inverse) selects between them.
-__global__
-void fft_stage_kernel(GpuComplex *data, size_t N, size_t stage, int dir) {
-    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t m = 1U << stage;
-    size_t half = m >> 1;
-    size_t total_pairs = N >> 1;
-
-    if (idx >= total_pairs) return;
-
-    size_t group = idx / half;
-    size_t pos   = idx % half;
-
-    size_t i = group * m + pos;
-    size_t j = i + half;
-
-    float angle = (float)dir * -2.0f * M_PI * ((float)pos) / ((float)m);
-    GpuComplex w = {cosf(angle), sinf(angle)};
-
-    GpuComplex u = data[i];
-    GpuComplex t = cplx_mul(w, data[j]);
-
-    data[i].real = u.real + t.real;
-    data[i].imag = u.imag + t.imag;
-    data[j].real = u.real - t.real;
-    data[j].imag = u.imag - t.imag;
+/* Butterfly index math shared by the tiled and global-memory stages.
+ * For pair index p in a stage with half-span `half` (m = 2*half):
+ *   pos = p % half            position within the group
+ *   i   = (p / half) * m + pos  upper element, j = i + half lower element */
+__device__ __forceinline__ void butterfly_idx(unsigned p, unsigned half,
+                                              unsigned *i, unsigned *pos) {
+    *pos = p & (half - 1);
+    *i   = ((p & ~(half - 1)) << 1) | *pos;
 }
 
-__global__
-void scale_kernel(GpuComplex *data, size_t N, float s) {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= N) return;
-    data[i].real *= s;
-    data[i].imag *= s;
-}
+/* Runs stages m = 2, 4, ..., tile entirely in shared memory.
+ * Each block owns one contiguous tile; loads and stores are coalesced. */
+static __global__ void fft_shared_kernel(float2 *data, unsigned tile, int dir) {
+    extern __shared__ float2 s_tile[];
+    const unsigned base = blockIdx.x * tile;
 
-// Every kernel goes on the default stream, so stage k cannot start before
-// stage k-1 retires: stream ordering already gives us the barrier we need.
-// The caller synchronizes once, when it wants the results back.
-static void fft_run(GpuComplex *d_data, size_t N, int dir) {
-    // Compute log2(N)
-    size_t logN = 0;
-    {
-        size_t tmp = N;
-        while (tmp > 1) {
-            tmp >>= 1;
-            ++logN;
+    for (unsigned k = threadIdx.x; k < tile; k += blockDim.x)
+        s_tile[k] = data[base + k];
+    __syncthreads();
+
+    for (unsigned m = 2; m <= tile; m <<= 1) {
+        const unsigned half = m >> 1;
+        for (unsigned p = threadIdx.x; p < (tile >> 1); p += blockDim.x) {
+            unsigned i, pos;
+            butterfly_idx(p, half, &i, &pos);
+            const unsigned j = i + half;
+
+            const float2 w = twiddle(dir, pos, m);
+            const float2 u = s_tile[i];
+            const float2 t = cplx_mul(w, s_tile[j]);
+            s_tile[i] = make_float2(u.x + t.x, u.y + t.y);
+            s_tile[j] = make_float2(u.x - t.x, u.y - t.y);
         }
+        __syncthreads();
     }
 
-    int blocks = (int)((N + THREADS - 1) / THREADS);
-    bit_reversal_permute<<<blocks, THREADS>>>(d_data, N, logN);
-
-    size_t total_pairs = N >> 1;
-    int blocks2 = (int)((total_pairs + THREADS - 1) / THREADS);
-    for (size_t s = 1; s <= logN; ++s)
-        fft_stage_kernel<<<blocks2, THREADS>>>(d_data, N, s, dir);
+    for (unsigned k = threadIdx.x; k < tile; k += blockDim.x)
+        data[base + k] = s_tile[k];
 }
 
-extern "C"
-int gpu_available(void) {
-    int deviceCount = 0;
-    cudaError_t err = cudaGetDeviceCount(&deviceCount);
-    if (err != cudaSuccess || deviceCount == 0) {
-        return 0;
-    }
-    return 1;
+/* One butterfly stage in global memory, for strides >= FFT_TILE.
+ * half >= FFT_TILE >> warp size, so consecutive threads touch consecutive
+ * elements in both halves of each group: every access is coalesced. */
+static __global__ void fft_global_kernel(float2 *data, unsigned pairs,
+                                         unsigned half, int dir) {
+    const unsigned p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= pairs) return;
+
+    unsigned i, pos;
+    butterfly_idx(p, half, &i, &pos);
+    const unsigned j = i + half;
+
+    const float2 w = twiddle(dir, pos, half << 1);
+    const float2 u = data[i];
+    const float2 t = cplx_mul(w, data[j]);
+    data[i] = make_float2(u.x + t.x, u.y + t.y);
+    data[j] = make_float2(u.x - t.x, u.y - t.y);
 }
 
-extern "C"
-void fft_gpu(GpuComplex *d_data, size_t N) {
-    fft_run(d_data, N, +1);
+static __global__ void fft_scale_kernel(float2 *data, unsigned n, float s) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    data[i].x *= s;
+    data[i].y *= s;
 }
 
-extern "C"
-void ifft_gpu(GpuComplex *d_data, size_t N) {
-    fft_run(d_data, N, -1);
+static void fft_run(float2 *d, size_t N, int dir) {
+    const unsigned n = (unsigned)N;
+    if (n < 2) return;
 
-    // Divide every element by N to complete the inverse transform
-    int blocks = (int)((N + THREADS - 1) / THREADS);
-    scale_kernel<<<blocks, THREADS>>>(d_data, N, 1.0f / (float)N);
+    unsigned logn = 0;
+    while ((1u << logn) < n) ++logn;
+
+    const unsigned blocks_n = (n + FFT_THREADS - 1) / FFT_THREADS;
+    fft_bitrev_kernel<<<blocks_n, FFT_THREADS>>>(d, n, 32 - logn);
+
+    const unsigned tile = n < FFT_TILE ? n : FFT_TILE;
+    fft_shared_kernel<<<n / tile, tile / 2, tile * sizeof(float2)>>>(d, tile, dir);
+
+    const unsigned pairs = n >> 1;
+    const unsigned blocks_p = (pairs + FFT_THREADS - 1) / FFT_THREADS;
+    for (unsigned m = tile << 1; m != 0 && m <= n; m <<= 1)
+        fft_global_kernel<<<blocks_p, FFT_THREADS>>>(d, pairs, m >> 1, dir);
+}
+
+extern "C" int gpu_available(void) {
+    int count = 0;
+    return cudaGetDeviceCount(&count) == cudaSuccess && count > 0;
+}
+
+extern "C" void fft_gpu(GpuComplex *d_data, size_t N) {
+    fft_run(reinterpret_cast<float2 *>(d_data), N, +1);
+}
+
+extern "C" void ifft_gpu(GpuComplex *d_data, size_t N) {
+    float2 *d = reinterpret_cast<float2 *>(d_data);
+    fft_run(d, N, -1);
+
+    const unsigned n = (unsigned)N;
+    if (n < 2) return;
+    const unsigned blocks = (n + FFT_THREADS - 1) / FFT_THREADS;
+    fft_scale_kernel<<<blocks, FFT_THREADS>>>(d, n, 1.0f / (float)n);
 }
