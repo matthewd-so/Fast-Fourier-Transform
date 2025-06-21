@@ -1,0 +1,10 @@
+# Build outputs
+/fft
+/bench
+/fft_cpu
+*.o
+*.ncu-rep
+
+# Local tooling
+.claude/
+.DS_Store
