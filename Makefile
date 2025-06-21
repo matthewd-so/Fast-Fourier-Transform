@@ -13,7 +13,7 @@ SM   ?= 75
 NVCCFLAGS ?= -O3 -arch=sm_$(SM) -Iinclude -lineinfo
 CFLAGS    ?= -O3 -std=c99 -Iinclude
 
-GPU_SRC = src/fft_gpu.cu src/inv_fft.cu src/fft_cpu.c
+GPU_SRC = src/fft_gpu.cu src/fft_cpu.c
 HDR     = include/fft.h
 
 all: fft

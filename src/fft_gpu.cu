@@ -6,11 +6,13 @@
 #define M_PI 3.14159265358979323846f
 #endif
 
-__host__ __device__
-static GpuComplex gpu_exp(float theta) {
+#define THREADS 256
+
+__device__
+static GpuComplex cplx_mul(GpuComplex a, GpuComplex b) {
     GpuComplex c;
-    c.real = cosf(theta);
-    c.imag = sinf(theta);
+    c.real = a.real * b.real - a.imag * b.imag;
+    c.imag = a.real * b.imag + a.imag * b.real;
     return c;
 }
 
@@ -34,11 +36,13 @@ void bit_reversal_permute(GpuComplex *data, size_t N, size_t logN) {
     }
 }
 
+// One butterfly stage. Forward and inverse differ only in the sign of the
+// twiddle angle, so dir = +1 (forward) / -1 (inverse) selects between them.
 __global__
-void fft_stage_kernel(GpuComplex *data, size_t N, size_t stage) {
+void fft_stage_kernel(GpuComplex *data, size_t N, size_t stage, int dir) {
     size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-    size_t m = 1U << stage;       
-    size_t half = m >> 1; 
+    size_t m = 1U << stage;
+    size_t half = m >> 1;
     size_t total_pairs = N >> 1;
 
     if (idx >= total_pairs) return;
@@ -49,20 +53,47 @@ void fft_stage_kernel(GpuComplex *data, size_t N, size_t stage) {
     size_t i = group * m + pos;
     size_t j = i + half;
 
-    float angle = -2.0f * M_PI * ((float)pos) / ((float)m);
-    GpuComplex w = gpu_exp(angle);
+    float angle = (float)dir * -2.0f * M_PI * ((float)pos) / ((float)m);
+    GpuComplex w = {cosf(angle), sinf(angle)};
 
     GpuComplex u = data[i];
-    GpuComplex v = data[j];
-
-    GpuComplex t;
-    t.real = w.real * v.real - w.imag * v.imag;
-    t.imag = w.real * v.imag + w.imag * v.real;
+    GpuComplex t = cplx_mul(w, data[j]);
 
     data[i].real = u.real + t.real;
     data[i].imag = u.imag + t.imag;
     data[j].real = u.real - t.real;
     data[j].imag = u.imag - t.imag;
+}
+
+__global__
+void scale_kernel(GpuComplex *data, size_t N, float s) {
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    data[i].real *= s;
+    data[i].imag *= s;
+}
+
+static void fft_run(GpuComplex *d_data, size_t N, int dir) {
+    // Compute log2(N)
+    size_t logN = 0;
+    {
+        size_t tmp = N;
+        while (tmp > 1) {
+            tmp >>= 1;
+            ++logN;
+        }
+    }
+
+    int blocks = (int)((N + THREADS - 1) / THREADS);
+    bit_reversal_permute<<<blocks, THREADS>>>(d_data, N, logN);
+    cudaDeviceSynchronize();
+
+    size_t total_pairs = N >> 1;
+    int blocks2 = (int)((total_pairs + THREADS - 1) / THREADS);
+    for (size_t s = 1; s <= logN; ++s) {
+        fft_stage_kernel<<<blocks2, THREADS>>>(d_data, N, s, dir);
+        cudaDeviceSynchronize();
+    }
 }
 
 extern "C"
@@ -77,25 +108,15 @@ int gpu_available(void) {
 
 extern "C"
 void fft_gpu(GpuComplex *d_data, size_t N) {
-    // Compute log2(N)
-    size_t logN = 0;
-    {
-        size_t tmp = N;
-        while (tmp > 1) {
-            tmp >>= 1;
-            ++logN;
-        }
-    }
+    fft_run(d_data, N, +1);
+}
 
-    const int THREADS = 256;
+extern "C"
+void ifft_gpu(GpuComplex *d_data, size_t N) {
+    fft_run(d_data, N, -1);
+
+    // Divide every element by N to complete the inverse transform
     int blocks = (int)((N + THREADS - 1) / THREADS);
-    bit_reversal_permute<<<blocks, THREADS>>>(d_data, N, logN);
+    scale_kernel<<<blocks, THREADS>>>(d_data, N, 1.0f / (float)N);
     cudaDeviceSynchronize();
-
-    for (size_t s = 1; s <= logN; ++s) {
-        size_t total_pairs = N >> 1; 
-        int blocks2 = (int)((total_pairs + THREADS - 1) / THREADS);
-        fft_stage_kernel<<<blocks2, THREADS>>>(d_data, N, s);
-        cudaDeviceSynchronize();
-    }
 }
