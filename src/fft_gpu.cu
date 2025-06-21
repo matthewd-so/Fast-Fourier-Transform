@@ -73,6 +73,9 @@ void scale_kernel(GpuComplex *data, size_t N, float s) {
     data[i].imag *= s;
 }
 
+// Every kernel goes on the default stream, so stage k cannot start before
+// stage k-1 retires: stream ordering already gives us the barrier we need.
+// The caller synchronizes once, when it wants the results back.
 static void fft_run(GpuComplex *d_data, size_t N, int dir) {
     // Compute log2(N)
     size_t logN = 0;
@@ -86,14 +89,11 @@ static void fft_run(GpuComplex *d_data, size_t N, int dir) {
 
     int blocks = (int)((N + THREADS - 1) / THREADS);
     bit_reversal_permute<<<blocks, THREADS>>>(d_data, N, logN);
-    cudaDeviceSynchronize();
 
     size_t total_pairs = N >> 1;
     int blocks2 = (int)((total_pairs + THREADS - 1) / THREADS);
-    for (size_t s = 1; s <= logN; ++s) {
+    for (size_t s = 1; s <= logN; ++s)
         fft_stage_kernel<<<blocks2, THREADS>>>(d_data, N, s, dir);
-        cudaDeviceSynchronize();
-    }
 }
 
 extern "C"
@@ -118,5 +118,4 @@ void ifft_gpu(GpuComplex *d_data, size_t N) {
     // Divide every element by N to complete the inverse transform
     int blocks = (int)((N + THREADS - 1) / THREADS);
     scale_kernel<<<blocks, THREADS>>>(d_data, N, 1.0f / (float)N);
-    cudaDeviceSynchronize();
 }
