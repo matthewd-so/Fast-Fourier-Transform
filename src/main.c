@@ -1,123 +1,109 @@
+/*
+ * Demo: transform a 2^20-sample sine wave and locate its spectral peak.
+ *
+ * Built with nvcc (default) it runs on the GPU when one is present and
+ * falls back to the CPU otherwise. Built with -DFFT_CPU_ONLY (make fft_cpu)
+ * it compiles without any CUDA dependency.
+ */
 #include "fft.h"
+
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <complex.h>
-#include <math.h>
 #include <time.h>
+
+#ifndef FFT_CPU_ONLY
 #include <cuda_runtime.h>
+#endif
 
 #ifndef M_PI
-#define M_PI 3.14159265358979323846f
+#define M_PI 3.14159265358979323846
 #endif
 
 int main(void) {
-    const size_t N = 1 << 20; 
-    const float freq = 50.0f;
+    const size_t N = (size_t)1 << 20;
+    const float freq = 50.0f; /* cycles across the N-sample window */
 
-    // Allocate and fill the input buffer on the host (CPU).
-    float _Complex *h_input = (float _Complex *)malloc(N * sizeof(float _Complex));
-    if (!h_input) {
-        fprintf(stderr, "Error: could not allocate host memory\n");
+    GpuComplex *x = (GpuComplex *)malloc(N * sizeof *x);
+    if (!x) {
+        fprintf(stderr, "error: could not allocate %zu samples\n", N);
         return EXIT_FAILURE;
     }
     for (size_t i = 0; i < N; ++i) {
-        float t = (float)i / (float)N;
-        h_input[i] = sinf(2.0f * M_PI * freq * t) + 0.0f * I;
+        x[i].real = sinf(2.0f * (float)M_PI * freq * (float)i / (float)N);
+        x[i].imag = 0.0f;
     }
 
-    // Check if a CUDA device is available.
+    int ran_on_gpu = 0;
+
+#ifndef FFT_CPU_ONLY
     if (gpu_available()) {
         printf("CUDA device found. Running GPU FFT...\n");
 
-        // 1) Allocate device memory (N GpuComplex floats).
         GpuComplex *d_data = NULL;
-        size_t bytes = N * sizeof(GpuComplex);
+        const size_t bytes = N * sizeof *x;
         cudaError_t err = cudaMalloc((void **)&d_data, bytes);
         if (err != cudaSuccess) {
             fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(err));
-            free(h_input);
+            free(x);
             return EXIT_FAILURE;
         }
+        cudaMemcpy(d_data, x, bytes, cudaMemcpyHostToDevice);
 
-        // 2) Copy from h_input (float _Complex) → an intermediate GpuComplex array → d_data.
-        GpuComplex *h_temp = (GpuComplex *)malloc(bytes);
-        if (!h_temp) {
-            fprintf(stderr, "Error: could not allocate staging memory\n");
-            cudaFree(d_data);
-            free(h_input);
-            return EXIT_FAILURE;
-        }
-        for (size_t i = 0; i < N; ++i) {
-            h_temp[i].real = crealf(h_input[i]);
-            h_temp[i].imag = cimagf(h_input[i]);
-        }
-        cudaMemcpy(d_data, h_temp, bytes, cudaMemcpyHostToDevice);
-
-        // 3) Launch and time the GPU FFT using CUDA events.
         cudaEvent_t start, stop;
         cudaEventCreate(&start);
         cudaEventCreate(&stop);
+
         cudaEventRecord(start);
-
         fft_gpu(d_data, N);
-
         cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        float ms = 0.0f;
-        cudaEventElapsedTime(&ms, start, stop);
 
-        printf("GPU FFT completed in %.3f ms\n", ms);
-
-        // 4) Copy results back to host (into h_temp) and print first 5 bins.
-        cudaMemcpy(h_temp, d_data, bytes, cudaMemcpyDeviceToHost);
-        printf("First 5 FFT bins (magnitude):\n");
-        for (int i = 0; i < 5; ++i) {
-            float re = h_temp[i].real;
-            float im = h_temp[i].imag;
-            float mag = sqrtf(re * re + im * im);
-            printf("  Bin %d: %.5f\n", i, mag);
-        }
-
-        // Cleanup GPU resources
-        free(h_temp);
-        cudaFree(d_data);
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-    }
-    else {
-        // No CUDA device → fall back to CPU FFT.
-        printf("No CUDA device detected. Running CPU FFT...\n");
-
-        // Copy input into a separate buffer for CPU FFT (so h_input remains intact).
-        float _Complex *cpu_data = (float _Complex *)malloc(N * sizeof(float _Complex));
-        if (!cpu_data) {
-            fprintf(stderr, "Error: could not allocate CPU buffer\n");
-            free(h_input);
+        err = cudaEventSynchronize(stop);
+        if (err != cudaSuccess || (err = cudaGetLastError()) != cudaSuccess) {
+            fprintf(stderr, "GPU FFT failed: %s\n", cudaGetErrorString(err));
+            cudaFree(d_data);
+            free(x);
             return EXIT_FAILURE;
         }
-        for (size_t i = 0; i < N; ++i) {
-            cpu_data[i] = h_input[i];
-        }
 
-        // Time the CPU FFT using clock_gettime().
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, start, stop);
+        printf("GPU FFT completed in %.3f ms\n", ms);
+
+        cudaMemcpy(x, d_data, bytes, cudaMemcpyDeviceToHost);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        cudaFree(d_data);
+        ran_on_gpu = 1;
+    }
+#endif
+
+    if (!ran_on_gpu) {
+        printf("Running CPU FFT...\n");
+
         struct timespec t0, t1;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        fft_cpu(cpu_data, N);
+        fft_cpu(x, N);
         clock_gettime(CLOCK_MONOTONIC, &t1);
 
-        double elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
-                            (t1.tv_nsec - t0.tv_nsec) / 1e6;
-        printf("CPU FFT completed in %.3f ms\n", elapsed_ms);
-
-        printf("First 5 FFT bins (magnitude):\n");
-        for (int i = 0; i < 5; ++i) {
-            float mag = cabsf(cpu_data[i]);
-            printf("  Bin %d: %.5f\n", i, mag);
-        }
-
-        free(cpu_data);
+        const double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                          (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        printf("CPU FFT completed in %.3f ms\n", ms);
     }
 
-    free(h_input);
-    return 0;
+    /* A pure sine at `freq` cycles should peak at bin 50 with |X| = N/2. */
+    size_t peak = 0;
+    float peak_mag = 0.0f;
+    for (size_t k = 0; k < N / 2; ++k) {
+        const float mag = sqrtf(x[k].real * x[k].real + x[k].imag * x[k].imag);
+        if (mag > peak_mag) {
+            peak_mag = mag;
+            peak = k;
+        }
+    }
+    printf("Spectral peak: bin %zu, |X| = %.1f (expected bin %.0f, |X| = %.1f)\n",
+           peak, peak_mag, freq, (float)N / 2.0f);
+
+    free(x);
+    return EXIT_SUCCESS;
 }

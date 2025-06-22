@@ -1,52 +1,59 @@
+/*
+ * Single-threaded radix-2 Cooley-Tukey FFT (decimation in time).
+ * Serves as the CPU baseline for the benchmark; same algorithm the GPU
+ * kernels implement. Twiddle factors use a double-precision recurrence
+ * so the accumulated rotation stays accurate at large N.
+ */
 #include "fft.h"
-#include <complex.h>
+
 #include <math.h>
 
 #ifndef M_PI
-#define M_PI 3.14159265358979323846f
+#define M_PI 3.14159265358979323846
 #endif
 
-// In-place radix-2 Cooley-Tukey FFT on an array of float _Complex of length N.
-void fft_cpu(float _Complex *data, size_t N) {
+void fft_cpu(GpuComplex *data, size_t N) {
     size_t logN = 0;
-    {
-        size_t tmp = N;
-        while (tmp > 1) {
-            tmp >>= 1;
-            ++logN;
-        }
-    }
+    while (((size_t)1 << logN) < N)
+        ++logN;
 
-    // 2) Bit-reversal permutation
+    /* Bit-reversal permutation */
     for (size_t i = 0; i < N; ++i) {
-        size_t rev = 0;
-        size_t x = i;
+        size_t rev = 0, x = i;
         for (size_t j = 0; j < logN; ++j) {
             rev = (rev << 1) | (x & 1);
             x >>= 1;
         }
         if (rev > i) {
-            float _Complex tmp = data[i];
+            GpuComplex tmp = data[i];
             data[i] = data[rev];
             data[rev] = tmp;
         }
     }
 
-    // 3) Main Cooley-Tukey loop: for each stage s = 1 .. logN
+    /* Butterfly stages */
     for (size_t s = 1; s <= logN; ++s) {
-        size_t m = 1U << s;       
-        size_t half = m >> 1;     
-        float theta = -2.0f * M_PI / (float)m;
-        float _Complex wm = cosf(theta) + sinf(theta) * I;
+        const size_t m = (size_t)1 << s;
+        const size_t half = m >> 1;
+        const double theta = -2.0 * M_PI / (double)m;
+        const double wmr = cos(theta), wmi = sin(theta);
 
         for (size_t k = 0; k < N; k += m) {
-            float _Complex w = 1.0f + 0.0f * I;
+            double wr = 1.0, wi = 0.0;
             for (size_t j = 0; j < half; ++j) {
-                float _Complex t = w * data[k + j + half];
-                float _Complex u = data[k + j];
-                data[k + j]        = u + t;
-                data[k + j + half] = u - t;
-                w *= wm; 
+                const GpuComplex v = data[k + j + half];
+                const GpuComplex u = data[k + j];
+                const float tr = (float)(wr * v.real - wi * v.imag);
+                const float ti = (float)(wr * v.imag + wi * v.real);
+
+                data[k + j].real = u.real + tr;
+                data[k + j].imag = u.imag + ti;
+                data[k + j + half].real = u.real - tr;
+                data[k + j + half].imag = u.imag - ti;
+
+                const double nwr = wr * wmr - wi * wmi;
+                wi = wr * wmi + wi * wmr;
+                wr = nwr;
             }
         }
     }

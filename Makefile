@@ -21,8 +21,8 @@ all: fft
 fft: src/main.c $(GPU_SRC) $(HDR)
 	$(NVCC) $(NVCCFLAGS) src/main.c $(GPU_SRC) -o $@
 
-fft_cpu: src/main_cpu.c src/fft_cpu.c $(HDR)
-	$(CC) $(CFLAGS) src/main_cpu.c src/fft_cpu.c -o $@ -lm
+fft_cpu: src/main.c src/fft_cpu.c $(HDR)
+	$(CC) $(CFLAGS) -DFFT_CPU_ONLY src/main.c src/fft_cpu.c -o $@ -lm
 
 clean:
 	rm -f fft fft_cpu

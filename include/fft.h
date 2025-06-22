@@ -26,7 +26,7 @@ void fft_gpu(GpuComplex *d_data, size_t N);
 void ifft_gpu(GpuComplex *d_data, size_t N);
 
 /* In-place radix-2 Cooley-Tukey FFT on the CPU (single-threaded baseline). */
-void fft_cpu(float _Complex *data, size_t N);
+void fft_cpu(GpuComplex *data, size_t N);
 
 #ifdef __cplusplus
 }
