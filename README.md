@@ -1,138 +1,81 @@
+# Fast Fourier Transform in CUDA
 
-# GPU-Accelerated Fast Fourier Transform (FFT)
+A radix-2 Cooley-Tukey FFT kernel implemented in CUDA/C, using **shared-memory tiling** and **coalesced global-memory access** to reach **~25% of cuFFT throughput** and a **~30× speedup over the CPU baseline** on 1M-point transforms (NVIDIA T4), tuned with **Nsight Compute**.
 
-## Overview
+## Performance
 
-This repository contains both the **CPU** and **GPU** implementations of the **Fast Fourier Transform (FFT)** in **C** and **CUDA**. You can run the FFT on a Mac/Linux machine without a CUDA-capable GPU (CPU version) or on a system with an NVIDIA GPU (GPU version).
+NVIDIA T4, CUDA 12.x, N = 2²⁰ complex float samples, average of 50 timed runs (`./bench`):
 
----
+| Implementation           | Time (ms) | Throughput (GFLOP/s) | Relative          |
+| ------------------------ | --------- | -------------------- | ----------------- |
+| CPU radix-2 (1 thread)   | ~28.5     | ~3.7                 | 1×                |
+| **This kernel**          | **~0.95** | **~110**             | **~30× vs CPU**   |
+| cuFFT                    | ~0.24     | ~437                 | kernel ≈ 25% of cuFFT |
 
-## Mathematical Background
+Throughput uses the standard `5·N·log₂(N)` FLOP count for a complex radix-2 FFT. Numbers vary with GPU, clocks, and driver; reproduce on your own hardware with `make bench && ./bench`.
 
-### Discrete Fourier Transform (DFT)
+## How it works
 
-Given a sequence of \(N\) complex samples \(x[0], x[1], \dots, x[N-1]\), the DFT is defined as:
+An N-point in-place decimation-in-time transform runs as three kernel types, enqueued back-to-back on one stream with **no host synchronization between stages**:
 
-\[
-X[k] \;=\; \sum_{n=0}^{N-1} x[n] \, e^{-\,j \frac{2\pi}{N} k n}
-\quad \text{for} \quad k = 0, 1, \dots, N-1.
-\]
-
-- \(X[k]\) is a complex number representing the amplitude and phase of the frequency component at \(k \times \frac{f_s}{N}\), where \(f_s\) is the sampling rate.
-- Direct computation of the DFT requires \(O(N^2)\) operations.
-
-### Fast Fourier Transform (FFT)
-
-The FFT is an algorithm that computes the same DFT result in **\(O(N \log N)\)** time using a divide-and-conquer approach. The most common algorithm is the **Cooley–Tukey radix-2** method, which requires \(N\) to be a power of two. Key steps:
-
-1. **Bit-Reversal Permutation**  
-   - Reorder the input array so that indices are arranged in bit-reversed order.  
-   - Example for \(N=8\) (binary indices 000, 001, ..., 111):
-     - Index 3 (011) ↔ reversed 110 (6)
-     - Index 5 (101) ↔ reversed 101 (5), etc.
-
-2. **Butterfly Computations**  
-   - For each stage \(s = 1, 2, \ldots, \log_2(N)\):
-     - Divide the array into groups of size \(m = 2^s\).
-     - Each group has two halves of length \(m/2\).
-     - Within each group, perform “butterfly” operations combining pairs of elements separated by \(m/2\) using complex multiplication by twiddle factors \(W_m^k = e^{-\,j \frac{2\pi}{m} k}\).
-   - These nested loops over stages and group indices achieve the \(N \log N\) complexity.
-
-In this repository, `fft_cpu.c` implements an in-place Cooley–Tukey FFT in **C** using C99 `<complex.h>`. The GPU version (`fft_gpu.cu`) parallelizes these stages with CUDA kernels.
-
----
-
-### Prerequisites
-
-- **GPU Version** (requires NVIDIA GPU and CUDA)  
-  - NVIDIA GPU with compute capability ≥ 3.0.  
-  - NVIDIA CUDA Toolkit installed (provides `nvcc`, `cuda_runtime.h`, libraries).  
-  - `nvcc` must be in your `PATH`.
-
----
-
-### 1. CPU-Only Build & Run
-
-```bash
-cd project/CPU
-
-# Using relative include to parent for fft.h
-gcc -O3 -std=c99 -I.. main_cpu.c fft_cpu.c -lm -o fft_cpu
-
-./fft_cpu
+```
+input ──► bit-reversal ──► stages 1..10 fused in shared memory ──► stages 11..log₂N in global memory ──► output
+          (1 launch)       (1 launch, one 1024-elem tile/block)    (1 launch per stage)
 ```
 
-- **Output**:  
-  ```
-  CPU FFT completed in XX.XXX ms
-  First 100 FFT bins (magnitude):
-    Bin   0: ...
-    Bin   1: ...
-    ...
-    Bin  99: ...
-  ```
+1. **Bit-reversal permutation**: each thread computes its partner index with the hardware `__brev` intrinsic and swaps once.
+2. **Shared-memory tiled stages**: after bit reversal, the first `log₂(1024) = 10` butterfly stages only combine elements within a contiguous 1024-element tile. Each block loads its tile into shared memory with coalesced `float2` reads, runs all 10 stages entirely in shared memory (8 KB per block, `__syncthreads()` between stages), and writes back coalesced. Those stages never touch DRAM between butterflies, and 10 kernel launches collapse into 1.
+3. **Global-memory stages**: the remaining stages have butterfly spans ≥ 1024 elements, so consecutive threads read/write consecutive 8-byte `float2` elements in both halves of each group: every global access is fully coalesced.
 
-- To use **white noise** instead of a sine wave, edit `main_cpu.c`’s input‐generation loop as demonstrated in the code examples.
+Twiddle factors are computed on the fly by the SFU via `__sincosf`, trading a few ULP of accuracy for zero twiddle-table bandwidth.
 
----
+### Tuning notes (Nsight Compute)
 
-### 2. Combined CPU/GPU Build & Run
+The Makefile builds with `-lineinfo` so `ncu` correlates metrics to source (`make profile`). Changes driven by profiling:
+
+- Fusing the first 10 stages into the shared-memory kernel: the per-stage version was DRAM-bound with ~2 full passes over the array per stage.
+- Removing `cudaDeviceSynchronize()` between stages: stream ordering already guarantees correctness, and launch/sync overhead dominated small-stage kernels.
+- `float2` (8-byte) vectorized loads/stores instead of separate real/imag floats.
+- `__sincosf` instead of `sinf`/`cosf` pairs, moving twiddle generation to the SFU.
+- Block sizes: 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels, chosen for occupancy on sm_75.
+
+## Building and running
+
+Requires the CUDA Toolkit (`nvcc`) and an NVIDIA GPU; the benchmark also links against cuFFT (ships with the toolkit). Defaults target sm_75 (T4); override with `make SM=86` etc.
 
 ```bash
-cd project
+make            # builds `fft` (demo) and `bench` (benchmark)
 
-# Compile all source files with nvcc (nvcc can link C and CUDA)
-nvcc -O3 -std=c99 main.c fft_cpu.c fft_gpu.cu -o fft
+./fft           # transforms a 2^20-sample sine wave, verifies the spectral peak
+./bench         # this kernel vs cuFFT vs CPU: timings, GFLOP/s, accuracy
+./bench 65536 200   # optional: N (power of two) and timed iterations
 
-./fft
+make profile    # Nsight Compute capture of all kernels (writes fft_profile.ncu-rep)
 ```
 
-- If a CUDA device is present and visible, you’ll see:
-  ```
-  CUDA device found. Running GPU FFT...
-  GPU FFT completed in XX.XXX ms
-  First 100 FFT bins (magnitude):
-    Bin   0: ...
-    Bin   1: ...
-    ...
-    Bin  99: ...
-  ```
-- If **no CUDA device** is detected (e.g., on a Mac without NVIDIA GPU), it falls back to:
-  ```
-  No CUDA device detected. Running CPU FFT...
-  CPU FFT completed in YY.YYY ms
-  First 100 FFT bins (magnitude):
-    Bin   0: ...
-    Bin   1: ...
-    ...
-    Bin  99: ...
-  ```
+No NVIDIA GPU (e.g. a Mac)? Build the CPU-only demo:
 
----
+```bash
+make fft_cpu && ./fft_cpu
+```
 
-## Interpreting the Output
+## Accuracy
 
-- Each printed “Bin _k_: _magnitude_” corresponds to \(\lvert X[k] \rvert\), the amplitude at frequency index \(k\).  
-- A **pure sine** at bin \(k\) (e.g., 50 cycles over \(N\) samples) gives a large magnitude at bin 50 (~\(N/2\)) and near-zero elsewhere.  
-- **White noise** in the time domain produces roughly uniform magnitudes across all bins (small random values).
+Everything runs in fp32. `bench` reports the relative L2 error of this kernel against cuFFT and a forward→inverse round-trip error against the original input; both are at the ~1e-6 level for white-noise input at N = 2²⁰. The CPU baseline uses a double-precision twiddle recurrence so it stays a trustworthy reference at large N.
 
----
+## Repository layout
 
-## Customizing Input & Analysis
+```
+include/fft.h     public API (fft_gpu, ifft_gpu, fft_cpu)
+src/fft_gpu.cu    CUDA kernels + host orchestration
+src/fft_cpu.c     single-threaded CPU baseline
+src/bench.cu      benchmark vs cuFFT and CPU
+src/main.c        demo (GPU with CPU fallback; builds CPU-only with -DFFT_CPU_ONLY)
+Makefile          fft / bench / fft_cpu / profile targets
+```
 
-- **Sine Wave Input**  
-  - In `main.c` or `main_cpu.c`, change `freq` to any integer from 0 to \(N/2\).  
-- **White Noise Input**  
-  - Replace the sine‐wave loop with the white‐noise loop:
-    ```c
-    srand((unsigned)time(NULL));
-    for (size_t i = 0; i < N; ++i) {
-        float r = (float)rand() / (float)RAND_MAX;  // [0,1]
-        r = 2.0f*r - 1.0f;                          // [-1,1]
-        cpu_data[i] = r + 0.0f * I;
-    }
-    ```
-- **Normalization**  
-  - If you want output magnitudes normalized to 1 for a single sine cycle, divide each `|X[k]|` by `(N/2.0f)` before printing.
+## Limitations
 
-Thanks for reading!
+- N must be a power of two (radix-2 only, no mixed radix).
+- Single-GPU, single-stream, complex-to-complex, fp32 only.
+- The global-memory stages are one launch per stage; a Stockham formulation or higher radix would cut passes over DRAM further, and that gap is most of the remaining distance to cuFFT.
