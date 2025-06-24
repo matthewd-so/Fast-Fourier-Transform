@@ -15,8 +15,15 @@
  * All kernels are enqueued on the default stream with no intermediate
  * host synchronization; stream ordering alone enforces stage order.
  * Twiddle factors come from the SFU via __sincosf.
+ *
+ * The NVTX ranges below are host-side and therefore measure enqueue cost,
+ * not kernel duration -- which is exactly what makes them useful in the
+ * Nsight Systems timeline: they line the launch of each phase up against
+ * the CUDA HW row underneath it, so launch overhead and gaps between
+ * stages are visible. They compile away unless FFT_NVTX is defined.
  */
 #include "fft.h"
+#include "fft_profile.h"
 #include <cuda_runtime.h>
 
 #define FFT_TILE    1024u  /* elements per block in the shared-memory stages */
@@ -118,16 +125,22 @@ static void fft_run(float2 *d, size_t N, int dir) {
     unsigned logn = 0;
     while ((1u << logn) < n) ++logn;
 
+    FFT_RANGE_PUSH("bitrev");
     const unsigned blocks_n = (n + FFT_THREADS - 1) / FFT_THREADS;
     fft_bitrev_kernel<<<blocks_n, FFT_THREADS>>>(d, n, 32 - logn);
+    FFT_RANGE_POP();
 
+    FFT_RANGE_PUSH("shared stages");
     const unsigned tile = n < FFT_TILE ? n : FFT_TILE;
     fft_shared_kernel<<<n / tile, tile / 2, tile * sizeof(float2)>>>(d, tile, dir);
+    FFT_RANGE_POP();
 
+    FFT_RANGE_PUSH("global stages");
     const unsigned pairs = n >> 1;
     const unsigned blocks_p = (pairs + FFT_THREADS - 1) / FFT_THREADS;
     for (unsigned m = tile << 1; m != 0 && m <= n; m <<= 1)
         fft_global_kernel<<<blocks_p, FFT_THREADS>>>(d, pairs, m >> 1, dir);
+    FFT_RANGE_POP();
 }
 
 extern "C" int gpu_available(void) {
@@ -136,15 +149,20 @@ extern "C" int gpu_available(void) {
 }
 
 extern "C" void fft_gpu(GpuComplex *d_data, size_t N) {
+    FFT_RANGE_PUSH("fft_gpu");
     fft_run(reinterpret_cast<float2 *>(d_data), N, +1);
+    FFT_RANGE_POP();
 }
 
 extern "C" void ifft_gpu(GpuComplex *d_data, size_t N) {
+    FFT_RANGE_PUSH("ifft_gpu");
     float2 *d = reinterpret_cast<float2 *>(d_data);
     fft_run(d, N, -1);
 
     const unsigned n = (unsigned)N;
-    if (n < 2) return;
-    const unsigned blocks = (n + FFT_THREADS - 1) / FFT_THREADS;
-    fft_scale_kernel<<<blocks, FFT_THREADS>>>(d, n, 1.0f / (float)n);
+    if (n >= 2) {
+        const unsigned blocks = (n + FFT_THREADS - 1) / FFT_THREADS;
+        fft_scale_kernel<<<blocks, FFT_THREADS>>>(d, n, 1.0f / (float)n);
+    }
+    FFT_RANGE_POP();
 }

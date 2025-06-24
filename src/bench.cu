@@ -8,8 +8,14 @@
  * timed runs. The working buffer is restored from a pristine copy before
  * every run (untimed); CUDA events bracket only the transform itself.
  * Throughput uses the standard 5 * N * log2(N) FLOP count.
+ *
+ * Built as `bench_prof` (nvcc -DFFT_NVTX) this is also the harness the
+ * Nsight tools drive: NVTX ranges name each phase for the Nsight Systems
+ * timeline, and the timed loop is bracketed by cudaProfilerStart/Stop so
+ * `ncu --profile-from-start off` measures steady-state kernels only.
  */
 #include "fft.h"
+#include "fft_profile.h"
 
 #include <cuda_runtime.h>
 #include <cufft.h>
@@ -72,18 +78,25 @@ static void run_cufft(GpuComplex *d_data, size_t n, void *ctx) {
 
 /* Average GPU milliseconds per transform under the warmup/restore protocol. */
 static float time_transform(transform_fn fn, void *ctx, GpuComplex *d_work,
-                            const GpuComplex *d_ref, size_t n, int iters) {
+                            const GpuComplex *d_ref, size_t n, int iters,
+                            const char *label) {
     const size_t bytes = n * sizeof(GpuComplex);
     cudaEvent_t start, stop;
     CUDA_CHECK(cudaEventCreate(&start));
     CUDA_CHECK(cudaEventCreate(&stop));
 
+    FFT_RANGE_PUSH("warmup");
     for (int i = 0; i < 3; ++i) {
         CUDA_CHECK(cudaMemcpyAsync(d_work, d_ref, bytes, cudaMemcpyDeviceToDevice));
         fn(d_work, n, ctx);
     }
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
+    FFT_RANGE_POP();
+
+    /* Only this loop is inside the profiler capture range. */
+    FFT_RANGE_PUSH(label);
+    FFT_CAPTURE_BEGIN();
 
     float total = 0.0f;
     for (int i = 0; i < iters; ++i) {
@@ -96,6 +109,9 @@ static float time_transform(transform_fn fn, void *ctx, GpuComplex *d_work,
         CUDA_CHECK(cudaEventElapsedTime(&ms, start, stop));
         total += ms;
     }
+
+    FFT_CAPTURE_END();
+    FFT_RANGE_POP();
 
     CUDA_CHECK(cudaEventDestroy(start));
     CUDA_CHECK(cudaEventDestroy(stop));
@@ -139,6 +155,7 @@ int main(int argc, char **argv) {
     }
 
     /* CPU baseline: best of 3 runs. */
+    FFT_RANGE_PUSH("cpu baseline");
     double cpu_ms = 1e30;
     for (int i = 0; i < 3; ++i) {
         for (size_t k = 0; k < N; ++k) h_a[k] = h_in[k];
@@ -147,24 +164,32 @@ int main(int argc, char **argv) {
         const double t1 = wall_ms();
         if (t1 - t0 < cpu_ms) cpu_ms = t1 - t0;
     }
+    FFT_RANGE_POP();
 
+    FFT_RANGE_PUSH("device setup");
     GpuComplex *d_ref = NULL, *d_work = NULL;
     CUDA_CHECK(cudaMalloc((void **)&d_ref, bytes));
     CUDA_CHECK(cudaMalloc((void **)&d_work, bytes));
     CUDA_CHECK(cudaMemcpy(d_ref, h_in, bytes, cudaMemcpyHostToDevice));
+    FFT_RANGE_POP();
 
     /* This repo's kernel. */
-    const float custom_ms = time_transform(run_custom, NULL, d_work, d_ref, N, iters);
+    const float custom_ms =
+        time_transform(run_custom, NULL, d_work, d_ref, N, iters, "timed: this kernel");
     CUDA_CHECK(cudaMemcpy(h_a, d_work, bytes, cudaMemcpyDeviceToHost));
 
     /* cuFFT. */
     cufftHandle plan;
+    FFT_RANGE_PUSH("cufft plan");
     CUFFT_CHECK(cufftPlan1d(&plan, (int)N, CUFFT_C2C, 1));
-    const float cufft_ms = time_transform(run_cufft, &plan, d_work, d_ref, N, iters);
+    FFT_RANGE_POP();
+    const float cufft_ms =
+        time_transform(run_cufft, &plan, d_work, d_ref, N, iters, "timed: cuFFT");
     CUDA_CHECK(cudaMemcpy(h_b, d_work, bytes, cudaMemcpyDeviceToHost));
     CUFFT_CHECK(cufftDestroy(plan));
 
     /* Accuracy: against cuFFT, and forward->inverse round trip. */
+    FFT_RANGE_PUSH("accuracy checks");
     const double err_vs_cufft = rel_error(h_a, h_b, N);
     CUDA_CHECK(cudaMemcpy(d_work, d_ref, bytes, cudaMemcpyDeviceToDevice));
     fft_gpu(d_work, N);
@@ -173,6 +198,7 @@ int main(int argc, char **argv) {
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaMemcpy(h_a, d_work, bytes, cudaMemcpyDeviceToHost));
     const double err_roundtrip = rel_error(h_a, h_in, N);
+    FFT_RANGE_POP();
 
     printf("%-24s %10.3f ms   %8.1f GFLOP/s\n", "CPU radix-2 (1 thread)",
            cpu_ms, flops / (cpu_ms * 1e6));

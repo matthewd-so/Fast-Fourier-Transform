@@ -1,9 +1,15 @@
 # Build outputs
 /fft
 /bench
+/bench_prof
 /fft_cpu
 *.o
+
+# Profiler reports
+/profiles/
 *.ncu-rep
+*.nsys-rep
+*.sqlite
 
 # Local tooling
 .claude/
