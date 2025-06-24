@@ -46,6 +46,12 @@ Twiddle factors are computed on the fly by the SFU via `__sincosf`, trading a fe
 
 ## Profiling
 
+Every optimization in this repo came out of a profiler, in the same two-step
+loop each time: Nsight Systems first to find which part of the run was actually
+costing wall time, then Nsight Compute on the kernel that turned up, to find out
+why. Going straight to the counters tends to mean carefully optimizing a kernel
+that was never the problem.
+
 The benchmark doubles as the profiling harness. `make bench_prof` builds it with
 `-DFFT_NVTX`, which turns on NVTX ranges naming each phase of the run and a
 `cudaProfilerStart/Stop` bracket around the timed loop; the shipping `./bench`
@@ -60,21 +66,26 @@ make profile-full   # ncu --set full, cuFFT's kernels included
 
 Reports and text summaries land in `profiles/`.
 
-- **Nsight Systems** (`nsys`) shows the whole run: the CPU baseline, the H2D
+- **Nsight Systems** (`nsys`) covers the whole run: the CPU baseline, the H2D
   copy, cuFFT plan creation, and each timed iteration as a labeled NVTX row
-  above the CUDA hardware row. It is what makes launch overhead, gaps between
-  stages, and the stage-count difference against cuFFT visible.
-- **Nsight Compute** (`ncu`) profiles one kernel at a time: speed-of-light,
+  sitting directly above the CUDA hardware row. This is the view that exposed
+  the per-stage launch overhead and the host-side gaps where the GPU sat idle,
+  and it is where the stage-count difference against cuFFT is obvious.
+- **Nsight Compute** (`ncu`) then takes one kernel at a time: speed-of-light,
   sectors per request for the coalescing check, occupancy, and warp stall
-  reasons. `-lineinfo` and `--import-source yes` attribute those metrics to
-  lines of `src/fft_gpu.cu`.
+  reasons. `-lineinfo` and `--import-source yes` attribute those metrics back to
+  individual lines of `src/fft_gpu.cu`, which is what made the memory-access
+  fixes below straightforward to find.
 
-Changes this drove: fusing the first 10 stages into one shared-memory kernel
-(the per-stage version made ~2 full DRAM passes per stage), dropping
-`cudaDeviceSynchronize()` between stages once the timeline showed the GPU idling
-on host syncs, `float2` vectorized loads and stores, `__sincosf` for twiddles,
-and block sizes of 512 (tiled kernel) and 256 (elementwise kernels) for sm_75
-occupancy.
+What the two tools turned up, in the order the work happened:
+
+| Profiler evidence | Change |
+| --- | --- |
+| Timeline: one launch per butterfly stage, with the short early stages dominated by launch overhead and repeated DRAM round-trips | Fused the first `log₂(1024) = 10` stages into `fft_shared_kernel` — one launch, tile resident in shared memory |
+| Timeline: host-side gaps between stages with the GPU idle, waiting on `cudaDeviceSynchronize` | Dropped the per-stage sync; stream ordering already enforces stage order |
+| Nsight Compute: sectors per request above the coalesced ideal with separate real/imag float loads | Switched to 8-byte `float2` vectorized loads and stores |
+| Nsight Compute: `sinf`/`cosf` pairs showing up in the pipe utilization breakdown | `__sincosf`, moving twiddle generation onto the SFU with no twiddle table to read |
+| Nsight Compute: achieved occupancy below theoretical at the default block sizes | 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels, tuned for sm_75 |
 
 [docs/profiling.md](docs/profiling.md) covers the workflow in detail — what to
 look at in each report and how to fix the usual permission and version snags.
