@@ -1,6 +1,21 @@
 # Fast Fourier Transform in CUDA
 
-A radix-2 Cooley-Tukey FFT kernel implemented in CUDA/C, using **shared-memory tiling** and **coalesced global-memory access** to reach **~25% of cuFFT throughput** and a **~30× speedup over the CPU baseline** on 1M-point transforms (NVIDIA T4), tuned with **Nsight Compute**.
+A radix-2 Cooley-Tukey FFT written from scratch in CUDA/C, together with a
+single-threaded CPU baseline and a benchmark that checks the GPU kernel against
+cuFFT for both speed and accuracy.
+
+The project exists to work through what actually makes an FFT fast on a GPU. The
+transform itself is textbook decimation-in-time; the interesting part is the
+memory hierarchy around it. Early butterfly stages have short spans, so they are
+fused into a single kernel that keeps a tile of the signal resident in shared
+memory instead of streaming it through DRAM once per stage. Later stages have
+spans wide enough that global memory access stays fully coalesced. Everything
+runs on one stream with no host synchronization between stages, and both Nsight
+Systems and Nsight Compute are wired into the build to check that the design
+behaves the way it is supposed to.
+
+It is a learning exercise, not a cuFFT replacement — power-of-two sizes only,
+single GPU, complex-to-complex fp32.
 
 ## Performance
 
@@ -29,15 +44,40 @@ input ──► bit-reversal ──► stages 1..10 fused in shared memory ─�
 
 Twiddle factors are computed on the fly by the SFU via `__sincosf`, trading a few ULP of accuracy for zero twiddle-table bandwidth.
 
-### Tuning notes (Nsight Compute)
+## Profiling
 
-The Makefile builds with `-lineinfo` so `ncu` correlates metrics to source (`make profile`). Changes driven by profiling:
+The benchmark doubles as the profiling harness. `make bench_prof` builds it with
+`-DFFT_NVTX`, which turns on NVTX ranges naming each phase of the run and a
+`cudaProfilerStart/Stop` bracket around the timed loop; the shipping `./bench`
+build compiles all of that away.
 
-- Fusing the first 10 stages into the shared-memory kernel: the per-stage version was DRAM-bound with ~2 full passes over the array per stage.
-- Removing `cudaDeviceSynchronize()` between stages: stream ordering already guarantees correctness, and launch/sync overhead dominated small-stage kernels.
-- `float2` (8-byte) vectorized loads/stores instead of separate real/imag floats.
-- `__sincosf` instead of `sinf`/`cosf` pairs, moving twiddle generation to the SFU.
-- Block sizes: 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels, chosen for occupancy on sm_75.
+```bash
+make profile        # Nsight Systems timeline, then Nsight Compute metrics
+make profile-nsys   # timeline only
+make profile-ncu    # per-kernel counters for the fft_* kernels
+make profile-full   # ncu --set full, cuFFT's kernels included
+```
+
+Reports and text summaries land in `profiles/`.
+
+- **Nsight Systems** (`nsys`) shows the whole run: the CPU baseline, the H2D
+  copy, cuFFT plan creation, and each timed iteration as a labeled NVTX row
+  above the CUDA hardware row. It is what makes launch overhead, gaps between
+  stages, and the stage-count difference against cuFFT visible.
+- **Nsight Compute** (`ncu`) profiles one kernel at a time: speed-of-light,
+  sectors per request for the coalescing check, occupancy, and warp stall
+  reasons. `-lineinfo` and `--import-source yes` attribute those metrics to
+  lines of `src/fft_gpu.cu`.
+
+Changes this drove: fusing the first 10 stages into one shared-memory kernel
+(the per-stage version made ~2 full DRAM passes per stage), dropping
+`cudaDeviceSynchronize()` between stages once the timeline showed the GPU idling
+on host syncs, `float2` vectorized loads and stores, `__sincosf` for twiddles,
+and block sizes of 512 (tiled kernel) and 256 (elementwise kernels) for sm_75
+occupancy.
+
+[docs/profiling.md](docs/profiling.md) covers the workflow in detail — what to
+look at in each report and how to fix the usual permission and version snags.
 
 ## Building and running
 
@@ -49,8 +89,13 @@ make            # builds `fft` (demo) and `bench` (benchmark)
 ./fft           # transforms a 2^20-sample sine wave, verifies the spectral peak
 ./bench         # this kernel vs cuFFT vs CPU: timings, GFLOP/s, accuracy
 ./bench 65536 200   # optional: N (power of two) and timed iterations
+```
 
-make profile    # Nsight Compute capture of all kernels (writes fft_profile.ncu-rep)
+Profiling needs `nsys` and `ncu` on `PATH` (both ship with the toolkit):
+
+```bash
+make profile                       # both tools, reports written to profiles/
+make profile N=4194304 ITERS=50    # different size / iteration count
 ```
 
 No NVIDIA GPU (e.g. a Mac)? Build the CPU-only demo:
@@ -66,12 +111,15 @@ Everything runs in fp32. `bench` reports the relative L2 error of this kernel ag
 ## Repository layout
 
 ```
-include/fft.h     public API (fft_gpu, ifft_gpu, fft_cpu)
-src/fft_gpu.cu    CUDA kernels + host orchestration
-src/fft_cpu.c     single-threaded CPU baseline
-src/bench.cu      benchmark vs cuFFT and CPU
-src/main.c        demo (GPU with CPU fallback; builds CPU-only with -DFFT_CPU_ONLY)
-Makefile          fft / bench / fft_cpu / profile targets
+include/fft.h          public API (fft_gpu, ifft_gpu, fft_cpu)
+include/fft_profile.h  NVTX / cudaProfilerApi macros, no-ops without -DFFT_NVTX
+src/fft_gpu.cu         CUDA kernels + host orchestration
+src/fft_cpu.c          single-threaded CPU baseline
+src/bench.cu           benchmark vs cuFFT and CPU; doubles as the profiling harness
+src/main.c             demo (GPU with CPU fallback; builds CPU-only with -DFFT_CPU_ONLY)
+scripts/profile.sh     nsys / ncu runner behind the make profile targets
+docs/profiling.md      what to measure and how to read the reports
+Makefile               fft / bench / bench_prof / fft_cpu / profile targets
 ```
 
 ## Limitations
