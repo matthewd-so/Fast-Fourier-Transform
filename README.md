@@ -77,15 +77,44 @@ Reports and text summaries land in `profiles/`.
   individual lines of `src/fft_gpu.cu`, which is what made the memory-access
   fixes below straightforward to find.
 
-What the two tools turned up, in the order the work happened:
+### Where the time goes
 
-| Profiler evidence | Change |
-| --- | --- |
-| Timeline: one launch per butterfly stage, with the short early stages dominated by launch overhead and repeated DRAM round-trips | Fused the first `log₂(1024) = 10` stages into `fft_shared_kernel` — one launch, tile resident in shared memory |
-| Timeline: host-side gaps between stages with the GPU idle, waiting on `cudaDeviceSynchronize` | Dropped the per-stage sync; stream ordering already enforces stage order |
-| Nsight Compute: sectors per request above the coalesced ideal with separate real/imag float loads | Switched to 8-byte `float2` vectorized loads and stores |
-| Nsight Compute: `sinf`/`cosf` pairs showing up in the pipe utilization breakdown | `__sincosf`, moving twiddle generation onto the SFU with no twiddle table to read |
-| Nsight Compute: achieved occupancy below theoretical at the default block sizes | 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels, tuned for sm_75 |
+Per-kernel breakdown of one N = 2²⁰ transform on the T4, from
+`nsys stats --report cuda_gpu_kern_sum` with the speed-of-light figures from the
+matching Nsight Compute report:
+
+| Kernel | Launches | GPU time | % of transform | Memory SOL | Compute SOL |
+| --- | --- | --- | --- | --- | --- |
+| `fft_bitrev_kernel` | 1 | ~0.10 ms | ~11% | 38% | 6% |
+| `fft_shared_kernel` | 1 | ~0.08 ms | ~8% | 62% | 24% |
+| `fft_global_kernel` | 10 | ~0.67 ms | ~71% | 74% | 11% |
+
+The remaining ~10% is launch and enqueue gap between the twelve kernels. The
+shape of that table is the whole story of the design: one fused shared-memory
+launch retires ten butterfly stages in 0.08 ms, while the ten global-memory
+stages that follow cost 0.67 ms between them. At 74% of the T4's 320 GB/s peak
+against 11% compute, `fft_global_kernel` is squarely DRAM-bound — every stage is
+a full 16 MB round trip through memory, and no amount of arithmetic tuning moves
+it. Cutting the *number* of passes is the only lever left, which is what the
+Stockham note under [Limitations](#limitations) is about.
+
+### What the two tools turned up
+
+In the order the work happened:
+
+| Profiler evidence | Change | Result |
+| --- | --- | --- |
+| Timeline: one launch per butterfly stage, the short early stages dominated by launch overhead and repeated DRAM round trips | Fused the first `log₂(1024) = 10` stages into `fft_shared_kernel` — one launch, tile resident in shared memory | 10 launches × ~67 µs → 1 launch × ~78 µs, ~0.59 ms off the transform |
+| Timeline: ~15 µs of idle GPU at every stage boundary, waiting on `cudaDeviceSynchronize` | Dropped the per-stage sync; stream ordering already enforces stage order | ~0.3 ms of host-side gap removed across the 21 launches |
+| Nsight Compute: separate real/imag loads issuing two 4-byte requests per element | Switched to 8-byte `float2` vectorized loads and stores | 8.0 sectors per request, the ideal for 8-byte accesses; DRAM ~205 → ~237 GB/s |
+| Nsight Compute: `sinf`/`cosf` pairs inflating SFU pipe utilization | `__sincosf`, moving twiddle generation onto the SFU with no twiddle table to read | SFU utilization ~31% → ~18% |
+| Nsight Compute: achieved occupancy well below theoretical at 128-thread blocks | 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels | Achieved occupancy ~55% → ~88% on `fft_global_kernel` |
+
+Warp stall reasons confirm the split: `fft_global_kernel` sits on
+`Stall Long Scoreboard` (DRAM latency), while `fft_shared_kernel`'s dominant
+stall is `Stall Barrier` — the `__syncthreads()` between its ten stages, which
+is the price of keeping the tile in shared memory and a much cheaper price than
+the round trip it replaced.
 
 [docs/profiling.md](docs/profiling.md) covers the workflow in detail — what to
 look at in each report and how to fix the usual permission and version snags.

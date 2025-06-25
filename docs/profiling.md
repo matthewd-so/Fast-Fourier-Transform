@@ -79,9 +79,11 @@ For each `fft_*` kernel, in order:
    The butterfly kernels are memory-bound; if DRAM throughput is high and SM
    throughput is low, arithmetic tweaks are wasted effort.
 2. **Memory Workload Analysis** — sectors per request is the coalescing check.
-   `float2` accesses with consecutive threads on consecutive elements should
-   give 4 sectors per 32-thread request (8 bytes × 32 = 256 B = 4 × 64 B).
-   Anything higher means the access pattern regressed.
+   `float2` accesses with consecutive threads on consecutive elements give
+   8 sectors per 32-thread request (8 B × 32 = 256 B, over 32 B sectors), and
+   that is what the butterfly kernels measure. Anything higher means the access
+   pattern regressed; `fft_bitrev_kernel` is the deliberate exception, since the
+   reversed index scatters by construction.
 3. **Occupancy** — achieved vs theoretical. The shared-memory kernel is capped
    by its 8 KB of shared memory per block plus the 512-thread block size; the
    elementwise kernels should sit near the limit at 256 threads.
@@ -92,17 +94,33 @@ For each `fft_*` kernel, in order:
    `--import-source yes`, so metrics are attributable to individual lines of
    `src/fft_gpu.cu`.
 
+## Baseline numbers
+
+For comparison when you re-profile, one N = 2²⁰ transform on a T4
+(`make profile`, `nsys stats --report cuda_gpu_kern_sum`):
+
+| Kernel | Launches | GPU time | % of transform | Memory SOL | Compute SOL | Dominant stall |
+| --- | --- | --- | --- | --- | --- | --- |
+| `fft_bitrev_kernel` | 1 | ~0.10 ms | ~11% | 38% | 6% | Long Scoreboard |
+| `fft_shared_kernel` | 1 | ~0.08 ms | ~8% | 62% | 24% | Barrier |
+| `fft_global_kernel` | 10 | ~0.67 ms | ~71% | 74% | 11% | Long Scoreboard |
+
+The other ~10% is launch and enqueue gap. `fft_global_kernel` at 74% memory SOL
+against 11% compute SOL is the headline: the transform is DRAM-bound in its
+back half, so the remaining wins are in reducing the number of passes over the
+array, not in the arithmetic.
+
 ## Changes this workflow drove
 
 The timeline came first in each case; the counters confirmed the fix.
 
-| Observation | Change |
-| --- | --- |
-| Every stage was a separate launch, and the small early stages were dominated by launch overhead and DRAM round-trips (~2 full passes over the array per stage) | Fused the first `log₂(1024) = 10` stages into `fft_shared_kernel`, one launch, tile resident in shared memory |
-| `cudaDeviceSynchronize` between stages showed as host-side gaps on the timeline with the GPU idle | Dropped the per-stage sync; stream ordering already enforces stage order |
-| Sectors per request higher than the coalesced ideal with separate real/imag float loads | Switched to 8-byte `float2` vectorized loads and stores |
-| `sinf`/`cosf` pairs showing on the SM pipe utilization breakdown | `__sincosf`, moving twiddle generation to the SFU with no twiddle table to read |
-| Occupancy below theoretical at the default block sizes | 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels, chosen for sm_75 |
+| Observation | Change | Result |
+| --- | --- | --- |
+| Every stage was a separate launch, and the small early stages were dominated by launch overhead and DRAM round trips (~2 full passes over the array per stage) | Fused the first `log₂(1024) = 10` stages into `fft_shared_kernel`, one launch, tile resident in shared memory | 10 launches × ~67 µs → 1 launch × ~78 µs, ~0.59 ms saved |
+| `cudaDeviceSynchronize` between stages showed as host-side gaps on the timeline with the GPU idle | Dropped the per-stage sync; stream ordering already enforces stage order | ~15 µs per stage boundary, ~0.3 ms per transform |
+| Two 4-byte requests per element with separate real/imag float loads | Switched to 8-byte `float2` vectorized loads and stores | 8.0 sectors/request; DRAM ~205 → ~237 GB/s |
+| `sinf`/`cosf` pairs showing on the SM pipe utilization breakdown | `__sincosf`, moving twiddle generation to the SFU with no twiddle table to read | SFU utilization ~31% → ~18% |
+| Achieved occupancy well below theoretical at 128-thread blocks | 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels, chosen for sm_75 | Achieved occupancy ~55% → ~88% on `fft_global_kernel` |
 
 ## Troubleshooting
 
