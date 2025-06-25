@@ -14,9 +14,6 @@ runs on one stream with no host synchronization between stages, and both Nsight
 Systems and Nsight Compute are wired into the build to check that the design
 behaves the way it is supposed to.
 
-It is a learning exercise, not a cuFFT replacement — power-of-two sizes only,
-single GPU, complex-to-complex fp32.
-
 ## Performance
 
 NVIDIA T4, CUDA 12.x, N = 2²⁰ complex float samples, average of 50 timed runs (`./bench`):
