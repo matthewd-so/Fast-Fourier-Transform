@@ -20,15 +20,15 @@ NVIDIA T4, CUDA 12.x, N = 2²⁰ complex float samples, average of 50 timed runs
 
 | Implementation           | Time (ms) | Throughput (GFLOP/s) | Relative          |
 | ------------------------ | --------- | -------------------- | ----------------- |
-| CPU radix-2 (1 thread)   | ~61       | ~1.7                 | 1×                |
-| **This kernel**          | **~0.93** | **~113**             | **~65× vs CPU**   |
-| cuFFT                    | ~0.27     | ~385                 | kernel ≈ 29% of cuFFT |
+| CPU radix-2 (1 thread)   | ~60       | ~1.7                 | 1×                |
+| **This kernel**          | **~0.86** | **~122**             | **~70× vs CPU**   |
+| cuFFT                    | ~0.21     | ~499                 | kernel ≈ 25% of cuFFT |
 
 Throughput uses the standard `5·N·log₂(N)` FLOP count for a complex radix-2 FFT. Numbers vary with GPU, clocks, and driver; reproduce on your own hardware with `make bench && ./bench`.
 
 Every number on this page was measured on a free Colab T4, and
 [`notebooks/benchmark_colab.ipynb`](notebooks/benchmark_colab.ipynb) re-runs all
-of them from a clean clone in about two minutes — no local GPU needed:
+of them from a clean clone in about two minutes, with no local GPU needed:
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/matthewd-so/Fast-Fourier-Transform/blob/main/notebooks/benchmark_colab.ipynb)
 
@@ -77,36 +77,20 @@ Twiddle factors are computed on the fly by the SFU via `__sincosf`, trading a fe
 
 ## Profiling
 
-Every optimization in this repo came out of a profiler, in the same two-step
-loop each time: Nsight Systems first to find which part of the run was actually
-costing wall time, then Nsight Compute on the kernel that turned up, to find out
-why. Going straight to the counters tends to mean carefully optimizing a kernel
-that was never the problem.
-
-The benchmark doubles as the profiling harness. `make bench_prof` builds it with
-`-DFFT_NVTX`, which turns on NVTX ranges naming each phase of the run and a
-`cudaProfilerStart/Stop` bracket around the timed loop; the shipping `./bench`
-build compiles all of that away.
+`make bench_prof` builds the benchmark with `-DFFT_NVTX`, adding NVTX ranges per
+phase and a `cudaProfilerStart/Stop` bracket around the timed loop. The shipping
+`./bench` build compiles all of it away.
 
 ```bash
 make profile        # Nsight Systems timeline, then Nsight Compute metrics
 make profile-nsys   # timeline only
 make profile-ncu    # per-kernel counters for the fft_* kernels
 make profile-full   # ncu --set full, cuFFT's kernels included
+make ablate         # rebuild with each optimization removed, tabulate the cost
 ```
 
-Reports and text summaries land in `profiles/`.
-
-- **Nsight Systems** (`nsys`) covers the whole run: the CPU baseline, the H2D
-  copy, cuFFT plan creation, and each timed iteration as a labeled NVTX row
-  sitting directly above the CUDA hardware row. This is the view that exposed
-  the per-stage launch overhead and the host-side gaps where the GPU sat idle,
-  and it is where the stage-count difference against cuFFT is obvious.
-- **Nsight Compute** (`ncu`) then takes one kernel at a time: speed-of-light,
-  sectors per request for the coalescing check, occupancy, and warp stall
-  reasons. `-lineinfo` and `--import-source yes` attribute those metrics back to
-  individual lines of `src/fft_gpu.cu`, which is what made the memory-access
-  fixes below straightforward to find.
+Reports land in `profiles/`. [docs/profiling.md](docs/profiling.md) covers what
+to read in each one.
 
 ### Where the time goes
 
@@ -120,42 +104,56 @@ launches:
 | `fft_shared_kernel` | 1 | 0.199 ms | 21% | 29% | 92 | 42% | 96% |
 | `fft_global_kernel` | 10 | 0.651 ms | 70% | ~92% | ~268 | 14% | ~99% |
 
-Total 0.93 ms, which is what `./bench` reports end to end, so the table accounts
-for the whole transform.
+The twelve launches sum to 0.93 ms, which is what `./bench` reports end to end.
 
-Multiplying each kernel's duration by its achieved bandwidth gives the traffic it
-actually moved, and that is the number worth reading. A `fft_global_kernel` stage
-moves 17.5 MB against a 16.8 MB ideal (8.4 MB in, 8.4 MB out) — essentially
-perfect. At ~92% of the T4's peak against 14% compute it is squarely DRAM-bound,
-and no arithmetic tuning moves it; cutting the *number* of passes is the only
-lever left, which is what the Stockham note under
-[Limitations](#limitations) is about.
+Duration × achieved bandwidth gives the traffic a kernel actually moved. A
+`fft_global_kernel` stage moves 17.5 MB against a 16.8 MB ideal (8.4 in, 8.4
+out), so the access pattern is as good as that pass gets. At ~92% of peak
+against 14% compute it is DRAM-bound, and only cutting the number of passes
+moves it; see [Limitations](#limitations).
 
-The whole transform moves ~212 MB per 8 MB array. cuFFT does the same transform
-in two kernels and ~42 MB. That 5× traffic ratio, not any per-kernel
-inefficiency, is the remaining distance to cuFFT.
+The whole transform moves ~212 MB per 8 MB array; cuFFT does it in two kernels
+and ~42 MB. That 5× traffic ratio is the remaining distance.
 
-### What the two tools turned up
+### What each optimization is actually worth
 
-In the order the work happened:
+`make ablate` rebuilds the kernel with one optimization removed at a time and
+re-runs the benchmark, so the cost of each is measured rather than asserted.
+N = 2²⁰, 50 iterations, T4:
 
-| Profiler evidence | Change | Result |
-| --- | --- | --- |
-| Timeline: one launch per butterfly stage, the short early stages dominated by launch overhead and repeated DRAM round trips | Fused the first `log₂(1024) = 10` stages into `fft_shared_kernel` — one launch, tile resident in shared memory | 10 launches × ~67 µs → 1 launch × ~78 µs, ~0.59 ms off the transform |
-| Timeline: ~15 µs of idle GPU at every stage boundary, waiting on `cudaDeviceSynchronize` | Dropped the per-stage sync; stream ordering already enforces stage order | ~0.3 ms of host-side gap removed across the 21 launches |
-| Nsight Compute: separate real/imag loads issuing two 4-byte requests per element | Switched to 8-byte `float2` vectorized loads and stores | 8.0 sectors per request, the ideal for 8-byte accesses; DRAM ~205 → ~237 GB/s |
-| Nsight Compute: `sinf`/`cosf` pairs inflating SFU pipe utilization | `__sincosf`, moving twiddle generation onto the SFU with no twiddle table to read | SFU utilization ~31% → ~18% |
-| Nsight Compute: achieved occupancy well below theoretical at 128-thread blocks | 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels | Achieved occupancy ~55% → ~88% on `fft_global_kernel` |
-| Nsight Compute: `fft_bitrev_kernel` was 705 µs of a 1555 µs transform — 45% of the time and the slowest kernel in it, at 174 GB/s against the 268 GB/s the butterfly stages sustain. Duration × bandwidth said it moved ~123 MB to permute an 8 MB buffer: `__brev(i)` lands a stride away, so each 8-byte element dragged in its own 32-byte sector, twice | Rewrote it as a 32×32 tiled transpose staged through shared memory, so both the loads and the stores are full 256-byte transactions | 705 µs → 78 µs, 174 → 243 GB/s, ~123 MB → ~19 MB of traffic. Whole transform 1.45 ms → 0.93 ms, 15% → 29% of cuFFT |
+Two independent runs, since anything inside a few percent is run-to-run noise:
 
-Warp stall reasons confirm the split: `fft_global_kernel` sits on
-`Stall Long Scoreboard` (DRAM latency), while `fft_shared_kernel`'s dominant
-stall is `Stall Barrier` — the `__syncthreads()` between its ten stages, which
-is the price of keeping the tile in shared memory and a much cheaper price than
-the round trip it replaced.
+| Optimization removed | Run 1 | Run 2 | vs baseline |
+| --- | --- | --- | --- |
+| *(none, shipping build)* | 0.942 ms | 0.963 ms | baseline |
+| Tiled bit-reversal → element-at-a-time scatter | 1.588 ms | 1.589 ms | **1.65–1.69×** |
+| Shared-memory fusion → one launch per stage | 1.447 ms | 1.450 ms | **1.51–1.54×** |
+| Stream ordering → `cudaDeviceSynchronize` per stage | 1.046 ms | 0.993 ms | 1.03–1.11× |
+| 256-thread blocks → 128 | 0.961 ms | 0.967 ms | 1.00–1.02× |
+| `__sincosf` → `sinf`/`cosf` | 0.960 ms | 0.926 ms | 0.96–1.02× |
+| `float2` loads → separate 4-byte real/imag | 0.913 ms | 0.943 ms | 0.97–0.98× |
 
-[docs/profiling.md](docs/profiling.md) covers the workflow in detail — what to
-look at in each report and how to fix the usual permission and version snags.
+Two changes carry the design, and both reproduce tightly: coalescing the bit
+reversal is worth ~1.67× and fusing the first ten stages into shared memory
+~1.52×. Both attack the same thing: how many times the array crosses the
+memory bus. Removing the per-stage sync is worth something, but it straddles
+the noise floor at 1.03–1.11×, well short of the ~0.3 ms once claimed for it.
+
+The bottom three land within noise of the baseline, one of them on both sides
+of it, and the counters say why:
+
+- **`float2` vectorization**: no effect. Both builds report 8.0 sectors per
+  request and 269 GB/s on `fft_global_kernel`. nvcc emits the same access
+  pattern either way, so the hand-vectorization buys nothing here.
+- **`__sincosf`**: no effect, because `--use_fast_math` already maps `sinf` and
+  `cosf` onto the same SFU instructions. XU pipe utilization is 13.6% against
+  13.7%. The intrinsic is redundant with the build flag, not with the hardware.
+- **Block size**: no effect. `fft_global_kernel` occupancy is 90.3% at 256
+  threads and 90.6% at 128; it is limited by the grid, not the block.
+
+Warp stalls confirm the split: `fft_global_kernel` sits on
+`Stall Long Scoreboard` (DRAM latency), `fft_shared_kernel` on `Stall Barrier`
+(the `__syncthreads()` between its ten stages).
 
 ## Building and running
 
@@ -174,6 +172,7 @@ Profiling needs `nsys` and `ncu` on `PATH` (both ship with the toolkit):
 ```bash
 make profile                       # both tools, reports written to profiles/
 make profile N=4194304 ITERS=50    # different size / iteration count
+make ablate                        # cost of each optimization (nvcc only)
 ```
 
 No NVIDIA GPU (e.g. a Mac)? Build the CPU-only demo:
@@ -196,8 +195,10 @@ src/fft_cpu.c          single-threaded CPU baseline
 src/bench.cu           benchmark vs cuFFT and CPU; doubles as the profiling harness
 src/main.c             demo (GPU with CPU fallback; builds CPU-only with -DFFT_CPU_ONLY)
 scripts/profile.sh     nsys / ncu runner behind the make profile targets
+scripts/ablate.sh      rebuilds with each optimization removed, behind make ablate
+notebooks/             Colab notebook that reproduces the benchmark table
 docs/profiling.md      what to measure and how to read the reports
-Makefile               fft / bench / bench_prof / fft_cpu / profile targets
+Makefile               fft / bench / bench_prof / fft_cpu / profile / ablate targets
 ```
 
 ## Limitations

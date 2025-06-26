@@ -3,6 +3,7 @@
 /bench
 /bench_prof
 /fft_cpu
+/ablate/
 *.o
 
 # Profiler reports
@@ -12,5 +13,4 @@
 *.sqlite
 
 # Local tooling
-.claude/
 .DS_Store

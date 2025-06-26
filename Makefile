@@ -55,6 +55,9 @@ fft_cpu: src/main.c src/fft_cpu.c $(HDR)
 profile: bench_prof
 	$(PROFILE) all
 
+ablate:
+	SM=$(SM) N=$(N) ITERS=$(ITERS) ./scripts/ablate.sh
+
 profile-nsys: bench_prof
 	$(PROFILE) nsys
 
@@ -66,6 +69,6 @@ profile-full: bench_prof
 
 clean:
 	rm -f fft bench bench_prof fft_cpu fft_profile.ncu-rep
-	rm -rf $(PROFDIR)
+	rm -rf $(PROFDIR) ablate
 
-.PHONY: all profile profile-nsys profile-ncu profile-full clean
+.PHONY: all ablate profile profile-nsys profile-ncu profile-full clean

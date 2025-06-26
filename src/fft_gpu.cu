@@ -29,8 +29,27 @@
 #include "fft_profile.h"
 #include <cuda_runtime.h>
 
+/* Ablation switches. Each one puts a single pre-optimization behaviour back so
+ * that the cost of the corresponding change can be measured rather than
+ * asserted; `make ablate` builds one binary per switch and tabulates them.
+ * None of these are defined in a normal build. See docs/profiling.md.
+ *
+ *   FFT_ABLATE_NO_FUSION   every butterfly stage gets its own global launch
+ *   FFT_ABLATE_SYNC        cudaDeviceSynchronize() between stages
+ *   FFT_ABLATE_SCALAR      4-byte real/imag loads instead of 8-byte float2
+ *   FFT_ABLATE_SINCOS      sinf/cosf instead of the SFU's __sincosf
+ *   FFT_ABLATE_BLOCK128    128-thread blocks
+ *   FFT_ABLATE_SCATTER     element-at-a-time bit reversal instead of the tiled
+ *                          transpose (the old kernel is still in the tree as
+ *                          the small-n path, so this one costs nothing to keep)
+ */
+
 #define FFT_TILE    1024u  /* elements per block in the shared-memory stages */
+#ifdef FFT_ABLATE_BLOCK128
+#define FFT_THREADS 128u
+#else
 #define FFT_THREADS 256u   /* block size for the elementwise kernels */
+#endif
 #define FFT_PI      3.14159265358979323846f
 
 /* Bit-reversal tiling: 32 elements is 256 B of float2, one full coalesced
@@ -41,15 +60,32 @@
 #define FFT_BR_EDGE (1u << FFT_BR_BITS)
 #define FFT_BR_ROWS 8u    /* rows of the tile handled per thread-block pass */
 
+#ifdef FFT_ABLATE_SYNC
+#define FFT_ABLATE_BARRIER() cudaDeviceSynchronize()
+#else
+#define FFT_ABLATE_BARRIER() ((void)0)
+#endif
+
+#ifdef FFT_ABLATE_SCATTER
+#define FFT_ABLATE_SCATTER_ON 1
+#else
+#define FFT_ABLATE_SCATTER_ON 0
+#endif
+
 __device__ __forceinline__ float2 cplx_mul(float2 a, float2 b) {
     return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
 
 /* w = e^(dir * -2*pi*i * pos / m); dir = +1 forward, -1 inverse. */
 __device__ __forceinline__ float2 twiddle(int dir, unsigned pos, unsigned m) {
+    const float a = (float)dir * -2.0f * FFT_PI * (float)pos / (float)m;
+#ifdef FFT_ABLATE_SINCOS
+    return make_float2(cosf(a), sinf(a));
+#else
     float s, c;
-    __sincosf((float)dir * -2.0f * FFT_PI * (float)pos / (float)m, &s, &c);
+    __sincosf(a, &s, &c);
     return make_float2(c, s);
+#endif
 }
 
 /* Reverse the low `bits` bits of x. __brev reverses all 32, so shift the
@@ -161,6 +197,32 @@ static __global__ void fft_shared_kernel(float2 *data, unsigned tile, int dir) {
         data[base + k] = s_tile[k];
 }
 
+#ifdef FFT_ABLATE_SCALAR
+/* The access pattern from before the float2 change: real and imaginary parts
+ * fetched as two independent 4-byte loads. The parameter is float* rather than
+ * float2* deliberately -- with only 4-byte alignment provable, nvcc cannot
+ * merge the pair back into one 8-byte access and quietly undo the ablation. */
+static __global__ void fft_global_kernel(float *f, unsigned pairs,
+                                         unsigned half, int dir) {
+    const unsigned p = blockIdx.x * blockDim.x + threadIdx.x;
+    if (p >= pairs) return;
+
+    unsigned i, pos;
+    butterfly_idx(p, half, &i, &pos);
+    const unsigned j = i + half;
+
+    const float2 w = twiddle(dir, pos, half << 1);
+    const float ur = f[2u * i], ui = f[2u * i + 1u];
+    const float vr = f[2u * j], vi = f[2u * j + 1u];
+    const float tr = w.x * vr - w.y * vi;
+    const float ti = w.x * vi + w.y * vr;
+    f[2u * i]      = ur + tr;
+    f[2u * i + 1u] = ui + ti;
+    f[2u * j]      = ur - tr;
+    f[2u * j + 1u] = ui - ti;
+}
+#define FFT_GLOBAL_ARG(d) reinterpret_cast<float *>(d)
+#else
 /* One butterfly stage in global memory, for strides >= FFT_TILE.
  * half >= FFT_TILE >> warp size, so consecutive threads touch consecutive
  * elements in both halves of each group: every access is coalesced. */
@@ -179,6 +241,8 @@ static __global__ void fft_global_kernel(float2 *data, unsigned pairs,
     data[i] = make_float2(u.x + t.x, u.y + t.y);
     data[j] = make_float2(u.x - t.x, u.y - t.y);
 }
+#define FFT_GLOBAL_ARG(d) (d)
+#endif
 
 static __global__ void fft_scale_kernel(float2 *data, unsigned n, float s) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -195,7 +259,7 @@ static void fft_run(float2 *d, size_t N, int dir) {
     while ((1u << logn) < n) ++logn;
 
     FFT_RANGE_PUSH("bitrev");
-    if (logn >= 2u * FFT_BR_BITS) {
+    if (logn >= 2u * FFT_BR_BITS && !FFT_ABLATE_SCATTER_ON) {
         const dim3 br_block(FFT_BR_EDGE, FFT_BR_ROWS);
         fft_bitrev_tiled_kernel<<<n >> (2u * FFT_BR_BITS), br_block>>>(d, logn);
     } else {
@@ -203,17 +267,28 @@ static void fft_run(float2 *d, size_t N, int dir) {
         fft_bitrev_kernel<<<blocks_n, FFT_THREADS>>>(d, n, 32 - logn);
     }
     FFT_RANGE_POP();
+    FFT_ABLATE_BARRIER();
 
+#ifdef FFT_ABLATE_NO_FUSION
+    /* No shared-memory tile: start the global loop at m = 2 so that every
+     * butterfly stage gets its own launch and its own DRAM round trip. */
+    const unsigned tile = 1u;
+#else
     FFT_RANGE_PUSH("shared stages");
     const unsigned tile = n < FFT_TILE ? n : FFT_TILE;
     fft_shared_kernel<<<n / tile, tile / 2, tile * sizeof(float2)>>>(d, tile, dir);
     FFT_RANGE_POP();
+    FFT_ABLATE_BARRIER();
+#endif
 
     FFT_RANGE_PUSH("global stages");
     const unsigned pairs = n >> 1;
     const unsigned blocks_p = (pairs + FFT_THREADS - 1) / FFT_THREADS;
-    for (unsigned m = tile << 1; m != 0 && m <= n; m <<= 1)
-        fft_global_kernel<<<blocks_p, FFT_THREADS>>>(d, pairs, m >> 1, dir);
+    for (unsigned m = tile << 1; m != 0 && m <= n; m <<= 1) {
+        fft_global_kernel<<<blocks_p, FFT_THREADS>>>(FFT_GLOBAL_ARG(d), pairs,
+                                                     m >> 1, dir);
+        FFT_ABLATE_BARRIER();
+    }
     FFT_RANGE_POP();
 }
 
