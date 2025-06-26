@@ -26,6 +26,20 @@ NVIDIA T4, CUDA 12.x, N = 2²⁰ complex float samples, average of 50 timed runs
 
 Throughput uses the standard `5·N·log₂(N)` FLOP count for a complex radix-2 FFT. Numbers vary with GPU, clocks, and driver; reproduce on your own hardware with `make bench && ./bench`.
 
+Every number on this page was measured on a free Colab T4, and
+[`notebooks/benchmark_colab.ipynb`](notebooks/benchmark_colab.ipynb) re-runs all
+of them from a clean clone in about two minutes — no local GPU needed:
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/matthewd-so/Fast-Fourier-Transform/blob/main/notebooks/benchmark_colab.ipynb)
+
+The CPU baseline is this repo's own single-threaded radix-2 in `src/fft_cpu.c`,
+not FFTW, so read the speedup as "against a straightforward scalar
+implementation" rather than against a tuned CPU library. It is also the least
+stable number here: on a shared Colab vCPU the same baseline has come out
+anywhere between 60 ms and 101 ms, which moves the speedup from ~63× to ~118×.
+The table quotes the fastest CPU run, which is the one least flattering to the
+GPU.
+
 The ratio against cuFFT is strongly size-dependent, because the T4's L2 is 4 MB
 and a complex-float transform is 8·N bytes:
 

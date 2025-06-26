@@ -13,6 +13,8 @@
 #
 # SM defaults to 75 (NVIDIA T4). Override for other GPUs, e.g. `make SM=86`.
 # Profiling knobs: `make profile N=4194304 ITERS=20 PROFDIR=profiles`.
+# NCU_ITERS is the timed-iteration count for the Nsight Compute passes only,
+# kept separate because kernel replay makes each iteration expensive.
 # See docs/profiling.md for what to read in each report.
 
 NVCC ?= nvcc
@@ -23,10 +25,12 @@ NVCCFLAGS ?= -O3 -arch=sm_$(SM) -Iinclude --use_fast_math -lineinfo
 CFLAGS    ?= -O3 -std=c99 -Iinclude
 
 # Profiling defaults, passed through to scripts/profile.sh.
-N       ?= 1048576
-ITERS   ?= 20
-PROFDIR ?= profiles
-PROFILE  = BENCH=./bench_prof N=$(N) ITERS=$(ITERS) PROFDIR=$(PROFDIR) ./scripts/profile.sh
+N         ?= 1048576
+ITERS     ?= 20
+NCU_ITERS ?= 2
+PROFDIR   ?= profiles
+PROFILE    = BENCH=./bench_prof N=$(N) ITERS=$(ITERS) NCU_ITERS=$(NCU_ITERS) \
+             PROFDIR=$(PROFDIR) ./scripts/profile.sh
 
 GPU_SRC = src/fft_gpu.cu src/fft_cpu.c
 HDR     = include/fft.h include/fft_profile.h
