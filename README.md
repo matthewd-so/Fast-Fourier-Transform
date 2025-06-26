@@ -20,11 +20,31 @@ NVIDIA T4, CUDA 12.x, N = 2²⁰ complex float samples, average of 50 timed runs
 
 | Implementation           | Time (ms) | Throughput (GFLOP/s) | Relative          |
 | ------------------------ | --------- | -------------------- | ----------------- |
-| CPU radix-2 (1 thread)   | ~28.5     | ~3.7                 | 1×                |
-| **This kernel**          | **~0.95** | **~110**             | **~30× vs CPU**   |
-| cuFFT                    | ~0.24     | ~437                 | kernel ≈ 25% of cuFFT |
+| CPU radix-2 (1 thread)   | ~61       | ~1.7                 | 1×                |
+| **This kernel**          | **~0.93** | **~113**             | **~65× vs CPU**   |
+| cuFFT                    | ~0.27     | ~385                 | kernel ≈ 29% of cuFFT |
 
 Throughput uses the standard `5·N·log₂(N)` FLOP count for a complex radix-2 FFT. Numbers vary with GPU, clocks, and driver; reproduce on your own hardware with `make bench && ./bench`.
+
+The ratio against cuFFT is strongly size-dependent, because the T4's L2 is 4 MB
+and a complex-float transform is 8·N bytes:
+
+| N | working set | this kernel | cuFFT | ratio |
+| --- | --- | --- | --- | --- |
+| 2¹⁷ | 1 MB | 0.058 ms | 0.030 ms | 51% |
+| 2¹⁸ | 2 MB | 0.072 ms | 0.045 ms | 62% |
+| 2¹⁹ | 4 MB | 0.240 ms | 0.102 ms | 43% |
+| 2²⁰ | 8 MB | 0.858 ms | 0.212 ms | 25% |
+| 2²² | 32 MB | 4.27 ms | 0.966 ms | 23% |
+
+Up to 2 MB the whole array stays resident in L2 and the per-stage passes are
+nearly free; past 4 MB every stage becomes a full DRAM round trip, which is
+where the pass-count gap against cuFFT starts to bite.
+
+That sweep uses 30 iterations per size. This kernel's own time is steady across
+runs, but cuFFT's moves between ~0.21 and ~0.28 ms at N = 2²⁰ depending on where
+the clocks settle, so the ratio at that size lands anywhere from 25% to 30%
+without anything about either implementation changing.
 
 ## How it works
 
@@ -35,7 +55,7 @@ input ──► bit-reversal ──► stages 1..10 fused in shared memory ─�
           (1 launch)       (1 launch, one 1024-elem tile/block)    (1 launch per stage)
 ```
 
-1. **Bit-reversal permutation**: each thread computes its partner index with the hardware `__brev` intrinsic and swaps once.
+1. **Bit-reversal permutation**: done as a 32×32 tiled transpose through shared memory. Reversing an index is the same operation as swapping its top and bottom 5-bit fields and reversing each, so holding the middle bits fixed leaves a tile whose image is another tile, transposed. Rows are contiguous going in and columns are contiguous coming out, so staging the tile in shared memory makes both ends full 256-byte transactions. Tiles pair off under the permutation, so one block owns both halves of a pair and the swap stays in place with no scratch buffer.
 2. **Shared-memory tiled stages**: after bit reversal, the first `log₂(1024) = 10` butterfly stages only combine elements within a contiguous 1024-element tile. Each block loads its tile into shared memory with coalesced `float2` reads, runs all 10 stages entirely in shared memory (8 KB per block, `__syncthreads()` between stages), and writes back coalesced. Those stages never touch DRAM between butterflies, and 10 kernel launches collapse into 1.
 3. **Global-memory stages**: the remaining stages have butterfly spans ≥ 1024 elements, so consecutive threads read/write consecutive 8-byte `float2` elements in both halves of each group: every global access is fully coalesced.
 
@@ -77,23 +97,29 @@ Reports and text summaries land in `profiles/`.
 ### Where the time goes
 
 Per-kernel breakdown of one N = 2²⁰ transform on the T4, from
-`nsys stats --report cuda_gpu_kern_sum` with the speed-of-light figures from the
-matching Nsight Compute report:
+`make profile-ncu` (`ncu --section SpeedOfLight`), summed over the twelve
+launches:
 
-| Kernel | Launches | GPU time | % of transform | Memory SOL | Compute SOL |
-| --- | --- | --- | --- | --- | --- |
-| `fft_bitrev_kernel` | 1 | ~0.10 ms | ~11% | 38% | 6% |
-| `fft_shared_kernel` | 1 | ~0.08 ms | ~8% | 62% | 24% |
-| `fft_global_kernel` | 10 | ~0.67 ms | ~71% | 74% | 11% |
+| Kernel | Launches | GPU time | % of transform | DRAM | GB/s | Compute SOL | Occupancy |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `fft_bitrev_tiled_kernel` | 1 | 0.078 ms | 8% | 82% | 243 | 16% | 73% |
+| `fft_shared_kernel` | 1 | 0.199 ms | 21% | 29% | 92 | 42% | 96% |
+| `fft_global_kernel` | 10 | 0.651 ms | 70% | ~92% | ~268 | 14% | ~99% |
 
-The remaining ~10% is launch and enqueue gap between the twelve kernels. The
-shape of that table is the whole story of the design: one fused shared-memory
-launch retires ten butterfly stages in 0.08 ms, while the ten global-memory
-stages that follow cost 0.67 ms between them. At 74% of the T4's 320 GB/s peak
-against 11% compute, `fft_global_kernel` is squarely DRAM-bound — every stage is
-a full 16 MB round trip through memory, and no amount of arithmetic tuning moves
-it. Cutting the *number* of passes is the only lever left, which is what the
-Stockham note under [Limitations](#limitations) is about.
+Total 0.93 ms, which is what `./bench` reports end to end, so the table accounts
+for the whole transform.
+
+Multiplying each kernel's duration by its achieved bandwidth gives the traffic it
+actually moved, and that is the number worth reading. A `fft_global_kernel` stage
+moves 17.5 MB against a 16.8 MB ideal (8.4 MB in, 8.4 MB out) — essentially
+perfect. At ~92% of the T4's peak against 14% compute it is squarely DRAM-bound,
+and no arithmetic tuning moves it; cutting the *number* of passes is the only
+lever left, which is what the Stockham note under
+[Limitations](#limitations) is about.
+
+The whole transform moves ~212 MB per 8 MB array. cuFFT does the same transform
+in two kernels and ~42 MB. That 5× traffic ratio, not any per-kernel
+inefficiency, is the remaining distance to cuFFT.
 
 ### What the two tools turned up
 
@@ -106,6 +132,7 @@ In the order the work happened:
 | Nsight Compute: separate real/imag loads issuing two 4-byte requests per element | Switched to 8-byte `float2` vectorized loads and stores | 8.0 sectors per request, the ideal for 8-byte accesses; DRAM ~205 → ~237 GB/s |
 | Nsight Compute: `sinf`/`cosf` pairs inflating SFU pipe utilization | `__sincosf`, moving twiddle generation onto the SFU with no twiddle table to read | SFU utilization ~31% → ~18% |
 | Nsight Compute: achieved occupancy well below theoretical at 128-thread blocks | 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels | Achieved occupancy ~55% → ~88% on `fft_global_kernel` |
+| Nsight Compute: `fft_bitrev_kernel` was 705 µs of a 1555 µs transform — 45% of the time and the slowest kernel in it, at 174 GB/s against the 268 GB/s the butterfly stages sustain. Duration × bandwidth said it moved ~123 MB to permute an 8 MB buffer: `__brev(i)` lands a stride away, so each 8-byte element dragged in its own 32-byte sector, twice | Rewrote it as a 32×32 tiled transpose staged through shared memory, so both the loads and the stores are full 256-byte transactions | 705 µs → 78 µs, 174 → 243 GB/s, ~123 MB → ~19 MB of traffic. Whole transform 1.45 ms → 0.93 ms, 15% → 29% of cuFFT |
 
 Warp stall reasons confirm the split: `fft_global_kernel` sits on
 `Stall Long Scoreboard` (DRAM latency), while `fft_shared_kernel`'s dominant

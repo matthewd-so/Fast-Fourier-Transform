@@ -82,8 +82,10 @@ For each `fft_*` kernel, in order:
    `float2` accesses with consecutive threads on consecutive elements give
    8 sectors per 32-thread request (8 B × 32 = 256 B, over 32 B sectors), and
    that is what the butterfly kernels measure. Anything higher means the access
-   pattern regressed; `fft_bitrev_kernel` is the deliberate exception, since the
-   reversed index scatters by construction.
+   pattern regressed. `fft_bitrev_tiled_kernel` is held to the same standard:
+   the tiled transpose exists precisely so that the reversed index does not
+   scatter. `fft_bitrev_kernel`, the fallback for n < 1024, does scatter by
+   construction, but only ever runs on an array that fits in L2.
 3. **Occupancy** — achieved vs theoretical. The shared-memory kernel is capped
    by its 8 KB of shared memory per block plus the 512-thread block size; the
    elementwise kernels should sit near the limit at 256 threads.
@@ -97,18 +99,23 @@ For each `fft_*` kernel, in order:
 ## Baseline numbers
 
 For comparison when you re-profile, one N = 2²⁰ transform on a T4
-(`make profile`, `nsys stats --report cuda_gpu_kern_sum`):
+(`make profile-ncu`, driver 580.82.07, CUDA 12.x):
 
-| Kernel | Launches | GPU time | % of transform | Memory SOL | Compute SOL | Dominant stall |
-| --- | --- | --- | --- | --- | --- | --- |
-| `fft_bitrev_kernel` | 1 | ~0.10 ms | ~11% | 38% | 6% | Long Scoreboard |
-| `fft_shared_kernel` | 1 | ~0.08 ms | ~8% | 62% | 24% | Barrier |
-| `fft_global_kernel` | 10 | ~0.67 ms | ~71% | 74% | 11% | Long Scoreboard |
+| Kernel | Launches | GPU time | % of transform | DRAM | GB/s | Compute SOL | Occupancy |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `fft_bitrev_tiled_kernel` | 1 | 0.078 ms | 8% | 82% | 243 | 16% | 73% |
+| `fft_shared_kernel` | 1 | 0.199 ms | 21% | 29% | 92 | 42% | 96% |
+| `fft_global_kernel` | 10 | 0.651 ms | 70% | ~92% | ~268 | 14% | ~99% |
 
-The other ~10% is launch and enqueue gap. `fft_global_kernel` at 74% memory SOL
-against 11% compute SOL is the headline: the transform is DRAM-bound in its
-back half, so the remaining wins are in reducing the number of passes over the
-array, not in the arithmetic.
+The twelve launches sum to 0.93 ms, which is what `./bench` reports end to end.
+
+`fft_global_kernel` at ~92% DRAM against 14% compute is the headline: the
+transform is DRAM-bound in its back half, so the remaining wins are in reducing
+the number of passes over the array, not in the arithmetic. The useful cross
+check is duration × achieved bandwidth, which gives the traffic a kernel really
+moved — 17.5 MB per global stage against a 16.8 MB ideal is as good as that pass
+gets, and it was a 123 MB reading on the old scatter-based bit reversal that
+justified rewriting it as a transpose.
 
 ## Changes this workflow drove
 
@@ -121,6 +128,7 @@ The timeline came first in each case; the counters confirmed the fix.
 | Two 4-byte requests per element with separate real/imag float loads | Switched to 8-byte `float2` vectorized loads and stores | 8.0 sectors/request; DRAM ~205 → ~237 GB/s |
 | `sinf`/`cosf` pairs showing on the SM pipe utilization breakdown | `__sincosf`, moving twiddle generation to the SFU with no twiddle table to read | SFU utilization ~31% → ~18% |
 | Achieved occupancy well below theoretical at 128-thread blocks | 512 threads for the tiled kernel (one butterfly per thread per stage), 256 for the elementwise kernels, chosen for sm_75 | Achieved occupancy ~55% → ~88% on `fft_global_kernel` |
+| `fft_bitrev_kernel` was 705 µs of a 1555 µs transform — 45% of the time, and the slowest kernel in it at 174 GB/s where the butterfly stages sustain 268. Duration × bandwidth put its traffic at ~123 MB to permute an 8 MB buffer, i.e. a 32 B sector fetched per 8 B element, in both directions | Rewrote it as a 32×32 tiled transpose staged through shared memory: reversing an index swaps and reverses its two edge 5-bit fields, so rows are contiguous in and columns are contiguous out | 705 → 78 µs, 174 → 243 GB/s, ~123 → ~19 MB. Transform 1.45 → 0.93 ms, 15% → 29% of cuFFT |
 
 ## Troubleshooting
 
