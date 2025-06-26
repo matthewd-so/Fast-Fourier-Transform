@@ -29,8 +29,10 @@ NCU=${NCU:-ncu}
 
 die() { printf 'profile.sh: %s\n' "$*" >&2; exit 1; }
 
+have_tool() { command -v "$1" >/dev/null 2>&1; }
+
 require_tool() {
-    command -v "$1" >/dev/null 2>&1 || die \
+    have_tool "$1" || die \
         "$1 not found in PATH; it ships with the CUDA Toolkit, or standalone from developer.nvidia.com/nsight-$2"
 }
 
@@ -82,7 +84,13 @@ run_ncu() {
         --import-source yes \
         --force-overwrite \
         --export "$PROFDIR/fft_kernels" \
-        "$BENCH" "$N" "$NCU_ITERS" | tee "$PROFDIR/fft_kernels.txt"
+        "$BENCH" "$N" "$NCU_ITERS"
+
+    # --export sends the tables to the report and leaves only progress lines on
+    # stdout, so read the metrics back out of the report rather than tee-ing the
+    # run itself -- that is what used to leave a .txt with no numbers in it.
+    "$NCU" --import "$PROFDIR/fft_kernels.ncu-rep" --page details \
+        > "$PROFDIR/fft_kernels.txt"
     echo "==> wrote $PROFDIR/fft_kernels.ncu-rep and .txt"
 }
 
@@ -98,7 +106,10 @@ run_ncu_full() {
         --import-source yes \
         --force-overwrite \
         --export "$PROFDIR/fft_full" \
-        "$BENCH" "$N" 1 | tee "$PROFDIR/fft_full.txt"
+        "$BENCH" "$N" 1
+
+    "$NCU" --import "$PROFDIR/fft_full.ncu-rep" --page details \
+        > "$PROFDIR/fft_full.txt"
     echo "==> wrote $PROFDIR/fft_full.ncu-rep and .txt"
 }
 
@@ -106,6 +117,13 @@ case "${1:-all}" in
     nsys)     run_nsys ;;
     ncu)      run_ncu ;;
     ncu-full) run_ncu_full ;;
-    all)      run_nsys; run_ncu ;;
+    all)      # Nsight Systems is a separate download and is missing from some
+              # CUDA images; skip the timeline rather than lose the counters too.
+              if have_tool "$NSYS"; then
+                  run_nsys
+              else
+                  printf 'profile.sh: %s not found, skipping the timeline pass\n' "$NSYS" >&2
+              fi
+              run_ncu ;;
     *)        die "unknown mode '$1' (expected: nsys | ncu | ncu-full | all)" ;;
 esac

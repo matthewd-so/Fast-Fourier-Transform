@@ -3,7 +3,10 @@
  *
  * Pipeline for an N-point in-place transform (N a power of two):
  *
- *   1. Bit-reversal permutation                 fft_bitrev_kernel   (1 launch)
+ *   1. Bit-reversal permutation                 fft_bitrev_*_kernel (1 launch)
+ *      staged through shared memory as a tiled transpose so that both the
+ *      loads and the stores are coalesced; see the comment on
+ *      fft_bitrev_tiled_kernel for why the naive scatter is so expensive.
  *   2. First log2(FFT_TILE) butterfly stages    fft_shared_kernel   (1 launch)
  *      fused in one kernel: each block stages a contiguous tile of
  *      FFT_TILE elements through shared memory, so those stages never
@@ -30,6 +33,14 @@
 #define FFT_THREADS 256u   /* block size for the elementwise kernels */
 #define FFT_PI      3.14159265358979323846f
 
+/* Bit-reversal tiling: 32 elements is 256 B of float2, one full coalesced
+ * transaction, so the permutation is done on 32x32 tiles. FFT_BR_BITS is
+ * log2 of that edge; the +1 column of padding keeps the transposed shared
+ * reads off a single bank. */
+#define FFT_BR_BITS 5u
+#define FFT_BR_EDGE (1u << FFT_BR_BITS)
+#define FFT_BR_ROWS 8u    /* rows of the tile handled per thread-block pass */
+
 __device__ __forceinline__ float2 cplx_mul(float2 a, float2 b) {
     return make_float2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
 }
@@ -41,6 +52,16 @@ __device__ __forceinline__ float2 twiddle(int dir, unsigned pos, unsigned m) {
     return make_float2(c, s);
 }
 
+/* Reverse the low `bits` bits of x. __brev reverses all 32, so shift the
+ * result down; bits == 0 would make that a shift by 32, which is undefined. */
+__device__ __forceinline__ unsigned brev_bits(unsigned x, unsigned bits) {
+    return bits ? (__brev(x) >> (32u - bits)) : 0u;
+}
+
+/* Element-at-a-time bit reversal, used only for n < FFT_BR_EDGE^2.
+ * Thread i reads data[i] coalesced but data[__brev(i)] at a stride of n/32
+ * or worse, so each 8-byte element costs a whole 32-byte sector in both
+ * directions. That is fine for a tile that fits in L2 and ruinous past it. */
 static __global__ void fft_bitrev_kernel(float2 *data, unsigned n, unsigned shift) {
     const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
@@ -49,6 +70,54 @@ static __global__ void fft_bitrev_kernel(float2 *data, unsigned n, unsigned shif
         const float2 t = data[i];
         data[i] = data[r];
         data[r] = t;
+    }
+}
+
+/* Coalesced bit reversal, for n >= FFT_BR_EDGE^2.
+ *
+ * Split the index into three fields, hi and lo being FFT_BR_BITS wide:
+ *
+ *     i = [ hi | mid | lo ]      rev(i) = [ rev(lo) | rev(mid) | rev(hi) ]
+ *
+ * Reversing the whole word therefore swaps the two edge fields and reverses
+ * each in place. Holding `mid` fixed leaves a 32x32 tile indexed by (hi, lo)
+ * whose image is the tile at mid' = rev(mid), transposed with both axes bit
+ * reversed. Along a row of the source, lo runs over 32 consecutive elements
+ * (256 B, one transaction); down a column of the destination, rev(hi) does
+ * the same. Staging the tile in shared memory gets both.
+ *
+ * Tiles pair up -- mid and rev(mid) exchange contents -- so one block owns
+ * the pair, loads both before storing either, and the permutation stays in
+ * place with no scratch buffer. Blocks with rev(mid) < mid exit immediately;
+ * a tile that is its own image (rev(mid) == mid) is permuted alone. */
+static __global__ void fft_bitrev_tiled_kernel(float2 *data, unsigned logn) {
+    __shared__ float2 ta[FFT_BR_EDGE][FFT_BR_EDGE + 1];
+    __shared__ float2 tb[FFT_BR_EDGE][FFT_BR_EDGE + 1];
+
+    const unsigned mid   = blockIdx.x;
+    const unsigned mid_r = brev_bits(mid, logn - 2u * FFT_BR_BITS);
+    if (mid_r < mid) return;
+    const bool paired = (mid_r != mid);
+
+    /* Distance between consecutive values of hi, i.e. one full row. */
+    const unsigned row   = 1u << (logn - FFT_BR_BITS);
+    const unsigned baseA = mid   << FFT_BR_BITS;
+    const unsigned baseB = mid_r << FFT_BR_BITS;
+    const unsigned tx    = threadIdx.x;
+
+    for (unsigned hi = threadIdx.y; hi < FFT_BR_EDGE; hi += blockDim.y) {
+        ta[hi][tx] = data[hi * row + baseA + tx];
+        if (paired) tb[hi][tx] = data[hi * row + baseB + tx];
+    }
+    __syncthreads();
+
+    /* Thread tx owns destination offset tx, so it supplies the element whose
+     * hi field reverses to tx; the row index v likewise reverses to lo. */
+    const unsigned rtx = brev_bits(tx, FFT_BR_BITS);
+    for (unsigned v = threadIdx.y; v < FFT_BR_EDGE; v += blockDim.y) {
+        const unsigned rv = brev_bits(v, FFT_BR_BITS);
+        data[v * row + baseB + tx] = ta[rtx][rv];
+        if (paired) data[v * row + baseA + tx] = tb[rtx][rv];
     }
 }
 
@@ -126,8 +195,13 @@ static void fft_run(float2 *d, size_t N, int dir) {
     while ((1u << logn) < n) ++logn;
 
     FFT_RANGE_PUSH("bitrev");
-    const unsigned blocks_n = (n + FFT_THREADS - 1) / FFT_THREADS;
-    fft_bitrev_kernel<<<blocks_n, FFT_THREADS>>>(d, n, 32 - logn);
+    if (logn >= 2u * FFT_BR_BITS) {
+        const dim3 br_block(FFT_BR_EDGE, FFT_BR_ROWS);
+        fft_bitrev_tiled_kernel<<<n >> (2u * FFT_BR_BITS), br_block>>>(d, logn);
+    } else {
+        const unsigned blocks_n = (n + FFT_THREADS - 1) / FFT_THREADS;
+        fft_bitrev_kernel<<<blocks_n, FFT_THREADS>>>(d, n, 32 - logn);
+    }
     FFT_RANGE_POP();
 
     FFT_RANGE_PUSH("shared stages");
