@@ -6,7 +6,7 @@
 #define M_PI 3.14159265358979323846f
 #endif
 
-__host__ __device__
+__host__ __device__cvcvsvvsvsvsvds
 static GpuComplex gpu_exp(float theta) {
     GpuComplex c;
     c.real = cosf(theta);
