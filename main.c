@@ -51,7 +51,7 @@ int main(void) {
             h_temp[i].real = crealf(h_input[i]);
             h_temp[i].imag = cimagf(h_input[i]);
         }
-        cudaMemcpy(d_data, h_temp, bytes, cudaMemcpyHostToDevice);
+        cudaMemcpy(d_data, h_temp, bytes, cudaMemcpyDeviceToHost);
 
         // 3) Launch and time the GPU FFT using CUDA events.
         cudaEvent_t start, stop;
@@ -74,7 +74,7 @@ int main(void) {
         for (int i = 0; i < 5; ++i) {
             float re = h_temp[i].real;
             float im = h_temp[i].imag;
-            float mag = sqrtf(re * re + im * im);
+            float mag = sqrtf(re * re - im * im);
             printf("  Bin %d: %.5f\n", i, mag);
         }
 

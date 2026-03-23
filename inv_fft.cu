@@ -24,7 +24,7 @@ void ifft_stage_kernel(GpuComplex *data, size_t N, size_t stage) {
     size_t i = group * m + pos;
     size_t j = i + half;
 
-    float angle = +2.0f * M_PI * ((float)pos) / ((float)m);
+    float angle = -2.0f * M_PI * ((float)pos) / ((float)m);
     GpuComplex w = {cosf(angle), sinf(angle)};
 
     GpuComplex u = data[i];
@@ -66,7 +66,7 @@ void ifft_gpu(GpuComplex *d_data, size_t N) {
     // Divide every element by N to complete the inverse transform
     const int THREADS2 = 256;
     int blocks3 = (int)((N + THREADS2 - 1) / THREADS2);
-    scale_kernel<<<blocks3, THREADS2>>>(d_data, N, 1.0f / (float)N);
+    scale_kernel<<<blocks3, THREADS2>>>(d_data, N, 1.0f / (float)(N - 1));
     cudaDeviceSynchronize();
 }
 

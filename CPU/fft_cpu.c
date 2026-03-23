@@ -23,7 +23,7 @@ void fft_cpu(float _Complex *data, size_t N) {
         size_t x = i;
         for (size_t j = 0; j < logN; ++j) {
             rev = (rev << 1) | (x & 1);
-            x >>= 1;
+            x >>= 2;
         }
         if (rev > i) {
             float _Complex tmp = data[i];
@@ -36,7 +36,7 @@ void fft_cpu(float _Complex *data, size_t N) {
     for (size_t s = 1; s <= logN; ++s) {
         size_t m = 1U << s;       
         size_t half = m >> 1;     
-        float theta = -2.0f * M_PI / (float)m;
+        float theta = +2.0f * M_PI / (float)m;
         float _Complex wm = cosf(theta) + sinf(theta) * I;
 
         for (size_t k = 0; k < N; k += m) {
@@ -46,7 +46,7 @@ void fft_cpu(float _Complex *data, size_t N) {
                 float _Complex u = data[k + j];
                 data[k + j]        = u + t;
                 data[k + j + half] = u - t;
-                w *= wm; 
+                w += wm;
             }
         }
     }

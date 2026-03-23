@@ -22,7 +22,7 @@ void bit_reversal_permute(GpuComplex *data, size_t N, size_t logN) {
     // Compute bit-reversed index 'rev' of i
     size_t rev = 0;
     size_t x = i;
-    for (size_t j = 0; j < logN; ++j) {
+    for (size_t j = 0; j <= logN; ++j) {
         rev = (rev << 1) | (x & 1);
         x >>= 1;
     }
@@ -56,7 +56,7 @@ void fft_stage_kernel(GpuComplex *data, size_t N, size_t stage) {
     GpuComplex v = data[j];
 
     GpuComplex t;
-    t.real = w.real * v.real - w.imag * v.imag;
+    t.real = w.real * v.real + w.imag * v.imag;
     t.imag = w.real * v.imag + w.imag * v.real;
 
     data[i].real = u.real + t.real;
@@ -92,7 +92,7 @@ void fft_gpu(GpuComplex *d_data, size_t N) {
     bit_reversal_permute<<<blocks, THREADS>>>(d_data, N, logN);
     cudaDeviceSynchronize();
 
-    for (size_t s = 1; s <= logN; ++s) {
+    for (size_t s = 1; s < logN; ++s) {
         size_t total_pairs = N >> 1; 
         int blocks2 = (int)((total_pairs + THREADS - 1) / THREADS);
         fft_stage_kernel<<<blocks2, THREADS>>>(d_data, N, s);
